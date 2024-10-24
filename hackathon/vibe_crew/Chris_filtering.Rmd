@@ -1,0 +1,202 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+## Per celltype filtering
+
+```{r}
+#Convert to SCE object
+Sce_object <- as.SingleCellExperiment(seurat)
+
+cells_celltype <- list()
+
+for (i in unique(seurat$Celltype)) {
+  cells_celltype[[i]] <- Sce_object[,rownames(as.data.frame(colData(Sce_object)) %>% dplyr::filter(Celltype == i))]
+}
+
+#Count cutoffs
+upper_cut_off_counts_celltype <- list()
+lower_cut_off_counts_celltype <- list()
+figures <- list()
+
+transcripts_counts_upper_outlier <- isOutlier(Sce_object$nCount_XENIUM, nmads = 2.5, share.mads = F,
+                                type="higher", batch=Sce_object$Celltype)
+
+transcripts_counts_lower_outlier <- isOutlier(Sce_object$nCount_XENIUM, nmads = 1.5, share.mads = F,
+                                type="lower", batch=Sce_object$Celltype)
+
+for (i in unique(seurat$Celltype)) {
+  
+  index <- match(i,unique(seurat$Celltype))
+  
+  upper_cut_off_counts_celltype[[i]] <- attr(transcripts_counts_upper_outlier, "thresholds")['higher', i]
+  lower_cut_off_counts_celltype[[i]] <- attr(transcripts_counts_lower_outlier, "thresholds")['lower', i]
+  
+  data <- data.frame(x=cells_celltype[[i]]$nCount_XENIUM, 
+                     Identity = cells_celltype[[i]]$Celltype)
+  
+  figures[[i]] <- ggplot(data,
+                        aes(x = x, fill = as.factor(Identity))) + 
+    geom_density(alpha = 0.5) +
+    geom_vline(xintercept = lower_cut_off_counts_celltype[[i]], colour="grey", linetype = "longdash") +
+    geom_vline(xintercept = upper_cut_off_counts_celltype[[i]], colour="grey", linetype = "longdash") +
+    labs(x = expression('log'[10]*'(Library Size)'), title = "Total count density", fill = "Ident") + 
+    theme_classic(base_size = 14)
+  
+} 
+
+combined_plot_reads <- ggpubr::ggarrange(plotlist = figures, ncol = 2, nrow = 2, align = 'h')
+
+# Get the number of unique subpopulations
+num_subpopulations <- length(unique(seurat$Celltype))
+
+# Calculate the number of chunks of 4 subpopulations
+num_chunks <- ceiling(num_subpopulations / 4)
+
+# Loop over the chunks
+for (i in seq_len(num_chunks)) {
+  # Calculate the start and end subpopulation for this chunk
+  start_subpopulation <- (i - 1) * 4 + 1
+  end_subpopulation <- min(i * 4, num_subpopulations)
+  
+  print(combined_plot_reads[[as.character(i)]])
+  
+}
+#Cell size cutoffs
+higher_cell_cut_off_size_celltype <- list()
+lower_cell_cut_off_size_celltype <- list()
+figures <- list()
+
+cell_size_upper_outlier <- isOutlier(Sce_object$cell_area, nmads = 2.5, share.mads = F,
+                                type="higher", batch=Sce_object$Celltype)
+
+cell_size_lower_outlier <- isOutlier(Sce_object$cell_area, nmads = 1.5, share.mads = F,
+                                type="lower", batch=Sce_object$Celltype)
+
+for (i in unique(seurat$Celltype)) {
+  
+  index <- match(i,unique(seurat$Celltype))
+  
+  higher_cell_cut_off_size_celltype[[i]] <- attr(cell_size_upper_outlier, "thresholds")['higher', i]
+  lower_cell_cut_off_size_celltype[[i]] <- attr(cell_size_lower_outlier, "thresholds")['lower', i]
+  
+  data <- data.frame(x=cells_celltype[[i]]$cell_area, 
+                     Identity = cells_celltype[[i]]$Celltype)
+  
+  figures[[i]] <- ggplot(data,
+                        aes(x = x, fill = as.factor(Identity))) + 
+    geom_density(alpha = 0.5) +
+    geom_vline(xintercept = higher_cell_cut_off_size_celltype[[i]], colour="grey", linetype = "longdash") +
+    geom_vline(xintercept = lower_cell_cut_off_size_celltype[[i]], colour="grey", linetype = "longdash") +
+    labs(x = expression('Cell Size'), title = "Total size density", fill = "Ident") + 
+    theme_classic(base_size = 14)
+  
+} 
+
+combined_plot_reads <- ggpubr::ggarrange(plotlist = figures, ncol = 2, nrow = 2, align = 'h')
+
+# Get the number of unique subpopulations
+num_subpopulations <- length(unique(seurat$Celltype))
+
+# Calculate the number of chunks of 4 subpopulations
+num_chunks <- ceiling(num_subpopulations / 4)
+
+# Loop over the chunks
+for (i in seq_len(num_chunks)) {
+  # Calculate the start and end subpopulation for this chunk
+  start_subpopulation <- (i - 1) * 4 + 1
+  end_subpopulation <- min(i * 4, num_subpopulations)
+  
+  print(combined_plot_reads[[as.character(i)]])
+  
+}
+
+#Cell Filtering
+
+count.drop <- list()
+size.drop <- list()
+
+SCE_objects <- list()
+SCE_objects.filtered <- list()
+
+for (i in unique(Sce_object$Celltype)) {
+  
+  SCE_objects[[i]] <- Sce_object[,colnames(cells_celltype[[i]])]
+  
+}
+
+for (i in unique(Sce_object$Celltype)) {
+
+  count.drop[[i]] <- grep('TRUE', cells_celltype[[i]]$nCount_XENIUM >= lower_cut_off_counts_celltype[[i]] & cells_celltype[[i]]$nCount_XENIUM <= upper_cut_off_counts_celltype[[i]])
+  size.drop[[i]] <- grep('TRUE', cells_celltype[[i]]$cell_area >= lower_cell_cut_off_size_celltype[[i]] & cells_celltype[[i]]$cell_area <= higher_cell_cut_off_size_celltype[[i]])
+  
+}
+
+for (i in unique(Sce_object$Celltype)) {
+  
+  SCE_objects.filtered[[i]] <- SCE_objects[[i]][,intersect(count.drop[[i]], size.drop[[i]])]
+  
+}
+
+cells_to_keep <- c()
+
+for (i in unique(Sce_object$Celltype)) {
+  
+  index <- match(i, unique(Sce_object$Celltype))
+
+  cells_to_keep <- c(cells_to_keep, colnames(SCE_objects.filtered[[i]]))
+  
+}
+
+Sce_object_filtered <- Sce_object[,cells_to_keep]
+
+# Export number of cells pre and post filtering
+
+print(paste0("Total cells before quality filtering = ",dim(Sce_object)[2]))
+print(paste0('Total cells before quality filtering, per sample:'))
+table(colData(Sce_object)$Donor_subpopulation)
+
+print(paste0("Total cells remaining after quality filtering = ",dim(Sce_object_filtered)[2]))
+print(paste0('Total cells after quality filtering, per sample:'))
+table(colData(Sce_object_filtered)$Celltype)
+
+df_number_of_cells <- data.frame(row.names = c('Before_filtering', 'After_filtering'))
+
+for (i in unique(Sce_object$Celltype)) {
+  
+  index <- match(i, unique(Sce_object$Celltype))
+
+  df_number_of_cells['Before_filtering', i] <- ncol(SCE_objects[[i]])
+  df_number_of_cells['After_filtering', i] <- ncol(SCE_objects.filtered[[i]])
+  
+}
+
+# Export qc metrics pre and post filtering
+
+df_qc <- data.frame()
+
+for (i in unique(Sce_object$Celltype)) {
+  
+  index <- match(i, unique(Sce_object$Celltype))
+
+  df_qc[i, 'Before_filtering__medianCount'] <- summary(colData(SCE_objects[[i]])$nCount_XENIUM)[[3]]
+  df_qc[i, 'After_filtering__medianCount'] <- summary(colData(SCE_objects.filtered[[i]])$nCount_XENIUM)[[3]]
+  df_qc[i, 'Before_filtering__medianSize'] <- summary(colData(SCE_objects[[i]])$nCount_XENIUM)[[3]]
+  df_qc[i, 'After_filtering__medianSize'] <- summary(colData(SCE_objects.filtered[[i]])$nCount_XENIUM)[[3]]
+  
+}
+```
+
+```{r Save the result}
+msd_barcodes <- colnames(Sce_object_filtered)
+write_csv(data.frame("cell_id" = msd_barcodes), file = "msd_barcodes.csv")
+```
+
+```{r Clean-up}
+remove(Sce_object)
+remove(Sce_object_filtered)
+remove(SCE_objects)
+remove(SCE_objects.filtered)
+```

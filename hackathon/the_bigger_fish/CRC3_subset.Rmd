@@ -1,0 +1,883 @@
+---
+title: "Colorectal cancer"
+output: html_document
+date: "2024-09-12"
+---
+
+# Spatial hackathon
+
+Analysis of colorectal cancer datasets. 
+
+Load packages
+```{r}
+library(Seurat)
+library(ggplot2)
+library(scCustomize)
+library(readr)
+library(pheatmap)
+library(matrixStats)
+library(spdep)
+library(geojsonR)
+```
+
+## Read data
+Load the data using ReadXenium (there are other platform-specific commands)
+
+
+```{r}
+data_dir <- "/project/shared/spatial_data_camp/datasets/DATASET2/XENIUM_COLORECTAL_CANCER"
+
+data <- ReadXenium(data_dir, 
+                   outs = c("matrix", # get the cellxgene matrix
+                            "microns"), # transcript coordinates
+                   type=c("centroids", # cell centroid coordinates
+                          "segmentations")) # cell segmentations
+names(data) # the components are saved as a list
+names(data$matrix) # the matrix has control components
+names(data$segmentations) #xy coordinates for each cell
+names(data$microns) # xy coordinates for each gene
+names(data$centroids) # xy coordinates for each cell centroid
+
+dim(data$segmentations) # there are multiple coordinates per cell
+dim(data$centroids) # one per cell
+
+```
+
+This is a very big section so we are going to subset by some coordinates straight away.
+We could have done this in Xenium Explorer prior to loading the data but that would have involved having the data locally. 
+
+Subset the matrix to the dimensions 
+x 3000-5000
+y 2000-5000 
+These are similar dimensions to those used for the healthy tissue slice yesterday. 
+
+To do this we need to first create the seurat object.
+
+
+Read in additional information about the cells - this gives us pre-calculated information, for example segmented cell or nucleus size for each cell.
+```{r}
+cell_meta_data <- read.csv(file.path(data_dir, "cells.csv.gz"))
+rownames(cell_meta_data) <- cell_meta_data$cell_id
+head(cell_meta_data)
+```
+
+## Create a seurat object with the cellxgene matrix.
+Add the cell coordinates as metadata
+
+
+```{r}
+seurat <- CreateSeuratObject(counts = data$matrix[["Gene Expression"]],
+                                 assay = "XENIUM",
+                                 meta.data = cell_meta_data)
+seurat
+```
+## Add the spatial coordinates to the Seurat object 
+
+Creating the Field of View object can be problematic for large data sets and is optional. 
+
+But it lets you see the position of individual molecules. 
+
+In the SO the centroid info is required. The other parts of the image slot are optional and leaving them out can help improve performance. 
+
+Today we are leaving out the molecules because the data set is large. 
+
+```{r}
+# create a FOV object
+coords <- CreateFOV(coords = 
+                      list(centroids = CreateCentroids(data$centroids), 
+                           segmentation = CreateSegmentation(data$segmentations)),
+                    type = c("segmentation", "centroids"),
+                    # molecules = data$microns, # skip for large dataset
+                    assay = "XENIUM")
+# add the FOV object to the SO as a new "spatial field of view"
+seurat[["COLORECTAL_CANCER"]] <- coords # name carefully!
+seurat
+```
+Save the seurat object
+
+```{r}
+directory <- "/project/wolf1241/SHARED/spatial_data_camp/HACKATHON/the_bigger_fish"
+saveRDS(seurat, file = paste0(directory, "/Colorectal_cancer.rds")) # not yet run!
+```
+
+Make a subsetted FOV to see what the subset will look like
+Subset to the dimensions 
+x 3000-5000
+y 2000-5000 
+
+
+```{r}
+cropped <- Crop(seurat[["COLORECTAL_CANCER"]], x = c(3000, 5000), y = c(2000, 5000), coords = "plot")
+seurat[["CRC3"]] <- cropped
+seurat
+```
+
+Look at the cropped FOV
+
+```{r}
+ImageDimPlot(seurat, fov="CRC3", axes = TRUE)
+ImageDimPlot(seurat, axes = TRUE)
+
+```
+Create a new seurat object that is only the subset. 
+
+x 3000-5000
+y 2000-5000 
+
+The subset orientation is actually the other way than in the FOV. But in this case it doesn't really matter. 
+This is because seurat coordinates are not the same as the tissue coordinates. 
+The seurat plot x and y coordinates are the other way around.
+So you need to be careful when picking the section!
+
+
+```{r}
+
+# create a new so which is subsetted
+seurat_CRC3 <- seurat[, seurat$x_centroid >3000 & seurat$x_centroid < 5000 &
+                        seurat$y_centroid > 2000 & seurat$y_centroid < 5000]
+seurat_CRC3
+
+```
+
+Visualise the subset
+```{r}
+ImageDimPlot(seurat, fov="CRC3", axes = TRUE)
+ImageDimPlot(seurat_CRC3, axes = TRUE)
+ImageDimPlot(seurat_CRC3, fov = "CRC3", axes=TRUE)
+
+
+
+```
+
+We can see they are not actually identical but that is ok.
+
+Get rid of the "CRC3" field of view from the subsetted object because it is not needed
+
+```{r}
+seurat_CRC3[["CRC3"]] <- NULL#
+seurat_CRC3
+```
+Save the object!
+
+```{r}
+saveRDS(seurat, file = paste0(directory, "/CRC3_subset.rds"))
+```
+
+## Add controls to the seurat object
+Ideally should have done this before subsetting. 
+
+Need to subset the negative control matrices to the cells that are in seurat_CRC3
+Then add as separate assays to the subsetted SO. 
+
+```{r}
+seurat_CRC3[["Negative.Control.Codeword"]] <- CreateAssayObject(counts = data$matrix[["Negative Control Codeword"]][, WhichCells(seurat_CRC3)])
+seurat_CRC3[["Negative.Control.Probe"]] <- CreateAssayObject(counts = data$matrix[["Negative Control Probe"]][, WhichCells(seurat_CRC3)])
+seurat_CRC3[["Unassigned.Codeword"]] <- CreateAssayObject(counts = data$matrix[["Unassigned Codeword"]][, WhichCells(seurat_CRC3)])
+
+seurat_CRC3
+
+```
+
+## Quality Controls
+
+Total transcripts detected per cell
+```{r}
+ImageFeaturePlot(seurat_CRC3, "nCount_XENIUM") + scale_fill_viridis_c()
+```
+
+
+Total number of gene detected per cell
+
+```{r}
+ImageFeaturePlot(seurat_CRC3, "nFeature_XENIUM") + scale_fill_viridis_c()
+```
+The scale of the number of genes and features is comparable to the healthy tissue but we can already see that the tissue architecture is very different and disorganised. 
+
+Distribution of the number of features (genes) detected per cell
+
+```{r}
+ggplot(seurat[[]], aes(nFeature_XENIUM)) + geom_density()
+quantile(seurat$nFeature_XENIUM, c(0.01, 0.1, 0.5, 0.9, 0.99))
+```
+## Cell size
+
+Visualise the cell area calculated by the cell segmentation algorithm. Here we can examine the spatial organization and potential heterogeneity of cell sizes within your tissue sample
+
+```{r}
+ImageFeaturePlot(seurat_CRC3, "cell_area") + scale_fill_viridis_c()
+```
+The cells are quite small and squashed in the tissue. 
+
+Plot the cell-to-nucleus area ratio
+
+```{r}
+seurat_CRC3$cell_nucleus_ratio <- seurat_CRC3$nucleus_area / seurat_CRC3$cell_area
+ImageFeaturePlot(seurat_CRC3, "cell_nucleus_ratio") + scale_fill_viridis_c()
+```
+
+If we look at the distribution, we see that we have a big tail end of overly large cells.
+I think this is where the big spaces are in the middle.  
+
+```{r}
+ggplot(seurat_CRC3[[]], aes(cell_area)) + geom_density()
+```
+
+Plot cell area vs number of counts
+
+In this case, we can see that as expected, there is generally a correlation between cell area and transcript detection rate. 
+
+We don't really see the large cells with low counts like we did yesterday. 
+So maybe today we should not filter by cell size in the same way. 
+
+
+```{r}
+ggplot(seurat_CRC3[[]], aes(nCount_XENIUM, cell_area)) + geom_point() 
+```
+We can create a filter to remove the overly large cells from the analysis.
+Actually I think this is a good thing as I think these are cells in the spaces.
+
+```{r}
+# calculate and add to metadata
+seurat_CRC3[["SIZE_FILTER_LARGE"]] <- seurat_CRC3$cell_area < quantile(seurat_CRC3$cell_area, .99) #calc 99th centile for cell area (TRUE/FALSE)
+# visualise which cells would be removed 
+
+ImageDimPlot(seurat_CRC3, group.by="SIZE_FILTER_LARGE")
+
+```
+
+Likewise create a filter for small cells
+
+```{r}
+seurat_CRC3[["SIZE_FILTER_SMALL"]] <- seurat_CRC3$cell_area > quantile(seurat_CRC3$cell_area, .01)
+ImageDimPlot(seurat_CRC3, group.by="SIZE_FILTER_SMALL")
+```
+Visualise the number of counts across small and large cells
+Shows that the smaller cells do indeed have fewer counts.
+These thresholds need to be set carefully, e.g. changing to 10% would lose too many small cells such as T cells.
+
+```{r fig.height=10, fig.width=7}
+p1 <- VlnPlot(seurat_CRC3, "nFeature_XENIUM", group.by = "SIZE_FILTER_SMALL", pt.size = .1, alpha = .5) + labs(title="Small Cell Filter")
+p2 <- VlnPlot(seurat_CRC3, "nFeature_XENIUM", group.by = "SIZE_FILTER_LARGE", pt.size = .1, alpha = .5)+ labs(title="Large Cell Filter")
+
+p1 + p2
+```
+Smaller cells have lower counts. 
+Larger cells generally don't have higher counts. 
+
+## Filtering on transcript abundance
+
+Create a filter for <15 transcripts per cell and visualise which cells would be filtered. 
+
+```{r}
+seurat_CRC3$TRANSCRIPT_FILTER <- seurat_CRC3$nCount_XENIUM >= 15
+ImageDimPlot(seurat_CRC3, group.by="TRANSCRIPT_FILTER")
+```
+## Visualise negative controls
+
+Here these have little signal so data is good quality. 
+
+```{r fig.height=7, fig.width=7}
+ImageFeaturePlot(seurat_CRC3, "nCount_Negative.Control.Codeword") + scale_fill_viridis_c()
+ImageFeaturePlot(seurat_CRC3, "nCount_Negative.Control.Probe") + scale_fill_viridis_c()
+ImageFeaturePlot(seurat_CRC3, "nCount_Unassigned.Codeword") + scale_fill_viridis_c()
+```
+
+Create a filter to remove cells that express negative controls (probably unncessary here)
+
+```{r}
+seurat_CRC3$PROBE_FILTER <- seurat_CRC3$nCount_Unassigned.Codeword == 0 &
+                       seurat_CRC3$nCount_Negative.Control.Codeword == 0 &
+                       seurat_CRC3$nCount_Negative.Control.Probe == 0
+ImageDimPlot(seurat_CRC3, group.by="PROBE_FILTER")
+```
+## Perform the filtering
+Base on any of the above criteria you think are important 
+Here we are using
+- probe filter (expression of negative controls)
+- size filters (large and small cells)
+- transcript filter (nCount > 15)
+
+```{r}
+seurat_CRC3 <- subset(seurat_CRC3, PROBE_FILTER & SIZE_FILTER_LARGE & SIZE_FILTER_SMALL & TRANSCRIPT_FILTER)
+seurat_CRC3
+```
+This filtered out about 5000 cells.
+
+Save RDS object
+
+```{r}
+saveRDS(seurat_CRC3, file = paste0(directory, "/CRC3_subset_filtered.rds"))
+```
+
+## Normalisation & dim reduction
+
+Normalise with SCTransform & run PCA
+
+```{r}
+seurat_CRC3 <- SCTransform(seurat_CRC3, assay = "XENIUM", clip.range = c(-10, 10))
+seurat_CRC3 <- RunPCA(seurat_CRC3)
+```
+
+Elbow plot
+
+```{r}
+ElbowPlot(seurat_CRC3, 50)
+```
+
+Explore the principle components
+
+```{r fig.height=9, fig.width=7}
+PC_Plotting(seurat_CRC3, dim_number = 1)
+```
+Visualise a gene that is one of the top genes in PC1
+
+```{r}
+FeaturePlot(seurat_CRC3, "IGFBP7", reduction = "pca") + scale_color_viridis_c()
+FeaturePlot(seurat_CRC3, "CD24", reduction = "pca") + scale_color_viridis_c()
+
+```
+
+Examine the PC loadings spatially. 
+Here, we can see that high PC1 loadings do start to delineate the tissue a bit. 
+```{r}
+ImageFeaturePlot(seurat_CRC3, "PC_1") + scale_fill_viridis_c()
+
+```
+We can plot the expression of high (or low) loading genes to visualise how this correlates with our dimensionality reduction.
+These two genes are pretty much mutually exclusive.
+```{r}
+ImageFeaturePlot(seurat_CRC3, "MS4A1", size=.5) + scale_fill_viridis_c()
+ImageFeaturePlot(seurat_CRC3, "ANXA1", size=.5) + scale_fill_viridis_c()
+```
+CD24 is expressed on Granulocytes and B cells
+
+
+
+### Clustering
+
+Run UMAP, Find Neighbours on PCA space and then Find Clusters
+
+```{r}
+seurat_CRC3 <- RunUMAP(seurat_CRC3, dims = 1:20)
+seurat_CRC3 <- FindNeighbors(seurat_CRC3, reduction = "pca", dims = 1:20)
+seurat_CRC3 <- FindClusters(seurat_CRC3, resolution = c(0.2, 0.4, 0.6, 0.8, 1))
+```
+
+
+Visualise the clusters in UMAP space
+
+```{r, fig.width=10, fig.height=6}
+
+p1 <- DimPlot(seurat_CRC3, label=T, repel=T, group.by = "SCT_snn_res.0.2" )
+p2 <- DimPlot(seurat_CRC3, label=T, repel=T, group.by = "SCT_snn_res.0.4" )
+p3 <- DimPlot(seurat_CRC3, label=T, repel=T, group.by = "SCT_snn_res.0.6" )
+p4 <- DimPlot(seurat_CRC3, label=T, repel=T, group.by = "SCT_snn_res.0.8" )
+p5 <- DimPlot(seurat_CRC3, label=T, repel=T, group.by = "SCT_snn_res.1" )
+
+p1 + p2/p3 + p4/p5 
+```
+
+Visualise the clusters in tissue space
+
+```{r}
+ImageDimPlot(seurat_CRC3, size=.5, group.by = "SCT_snn_res.0.2" )
+ImageDimPlot(seurat_CRC3, size=.5, group.by = "SCT_snn_res.0.4" )
+ImageDimPlot(seurat_CRC3, size=.5, group.by = "SCT_snn_res.0.6" )
+ImageDimPlot(seurat_CRC3, size=.5, group.by = "SCT_snn_res.0.8" )
+ImageDimPlot(seurat_CRC3, size=.5, group.by = "SCT_snn_res.1" )
+```
+
+Do the clustree
+
+```{r}
+#Add clustering for 0.1 and 0.3
+seurat_CRC3 <- FindClusters(seurat_CRC3, resolution = c(0.1, 0.3))
+clustree(seurat_CRC3)
+```
+
+Select resolution 0.3, might want to go higher later.
+
+```{r}
+Idents(seurat_CRC3) <- seurat_CRC3$SCT_snn_res.0.3
+DimPlot(seurat_CRC3, label=T, repel=T, group.by = "SCT_snn_res.0.3" )
+ImageDimPlot(seurat_CRC3, size=.5, group.by = "SCT_snn_res.0.3", axes = TRUE )
+```
+Find all markers
+```{r}
+markers <- FindAllMarkers(seurat_CRC3, max.cells.per.ident = 500)
+head(markers)
+```
+Extract top 5 markers per cluster
+```{r}
+top <- Extract_Top_Markers(markers, num_genes = 5, named_vector = FALSE, make_unique = TRUE)
+top
+```
+Visualise expression of these markers using dotplot 
+
+```{r fig.height=10, fig.width=7}
+Clustered_DotPlot(seurat_CRC3, features = top, k=18)
+```
+
+Can we do a heatmap?
+This doesn't work.
+```{r}
+DoHeatmap(seurat_CRC3, features = top)
+```
+
+## Annotation by label transfer
+
+Load a single-cell reference dataset.  
+```{r}
+ref <- readRDS("/project/shared/spatial_data_camp/datasets/SINGLE_CELL_REFERENCES/COLON_HC_5K_CELLS.RDS")
+ref
+```
+Visualise pre-computed cell labels and clusters in the single cell object
+```{r}
+DimPlot(ref)
+```
+Visualise what happens in the single cell object if you use only the genes in the spatial dataset for SCT and downstream steps. 
+
+```{r}
+ref <- SCTransform(ref, residual.features =rownames(seurat_CRC3))
+ref <- RunPCA(ref)
+ref <- RunUMAP(ref, dims=1:20)
+DimPlot(ref, label=T, repel=T)
+```
+
+Heatmap of gene panel expression across reference clusters
+We can see that some cell types are underrepresented in the gene panel. 
+This could be useful to do in the experimental design phase. 
+
+```{r}
+ps <- AggregateExpression(ref, features = rownames(seurat_CRC3), normalization.method = "LogNormalize", assays="RNA", return.seurat = T)
+ps <- ScaleData(ps, features=rownames(ps))
+pheatmap(LayerData(ps, layer="scale.data"), show_rownames = F)
+```
+Transfer labels from the ref to the spatial data
+
+```{r}
+anchors <- FindTransferAnchors(reference = ref, 
+                               query = seurat_CRC3, 
+                               normalization.method = "SCT")
+
+seurat_CRC3 <- TransferData(anchorset = anchors, 
+                       refdata = ref$CellType, 
+                       prediction.assay = TRUE,
+                       weight.reduction = seurat_CRC3[["pca"]], 
+                       query = seurat_CRC3, 
+                       dims=1:30)
+
+```
+```{r}
+#seurat[[]]
+DimPlot(seurat_CRC3, group.by= "predicted.id")
+DimPlot(seurat_CRC3, group.by= "SCT_snn_res.0.6")
+DimPlot(seurat_CRC3, group.by= "SCT_snn_res.0.8")
+DimPlot(seurat_CRC3, group.by= "SCT_snn_res.1")
+FeaturePlot(seurat_CRC3, features = "predicted.id.score")
+
+```
+
+It looks like we might want to use resolution 1 to get all the immune cells out, and then merge several epithelium clusters together. 
+
+View the predicted cell types on the tissue
+
+```{r}
+ImageDimPlot(seurat_CRC3, group.by = "predicted.id")
+```
+
+```{r}
+# find marker genes for the reference dataset
+ref
+ref_markers <- FindAllMarkers(ref)
+
+
+```
+Extract top 5 markers per cluster
+```{r}
+top_ref <- Extract_Top_Markers(ref_markers, num_genes = 5, named_vector = FALSE, make_unique = TRUE)
+top_ref_names <- Extract_Top_Markers(ref_markers, num_genes = 5, named_vector = TRUE)
+top_ref_names
+```
+
+```{r, fig.height=10, fig.width=10}
+rownames(ref)
+ref <- ScaleData(ref, features = rownames(ref), assay = "RNA")
+DoHeatmap(ref, features = top_ref, assay = "RNA")
+```
+Plot the top genes on the spatial data
+
+```{r}
+# Need more top genes
+top_ref <- Extract_Top_Markers(ref_markers, num_genes = 20, named_vector = FALSE, make_unique = TRUE)
+top_ref_named <- Extract_Top_Markers(ref_markers, num_genes = 20, named_vector = TRUE)
+Idents(seurat_CRC3) <- seurat_CRC3$SCT_snn_res.1
+DotPlot(seurat_CRC3, features = top_ref)+
+  coord_flip()
+# where is C1QC found?
+top_ref_named[grep("C1QC", top_ref_named)] # macrophages
+```
+
+Cluster 16 is B cells
+12 and 19 macrophages
+
+Map the auto annotation onto the spatial clusters. 
+
+```{r}
+pheatmap(table(seurat_CRC3$SCT_snn_res.1, seurat_CRC3$predicted.id))
+```
+Can we annotate using the top genes of any of the clusters?
+
+```{r}
+# run markers at res 1
+markers_1 <- FindAllMarkers(seurat_CRC3, max.cells.per.ident = 500)
+top_named_1 <- Extract_Top_Markers(markers_1, num_genes = 10, named_vector = TRUE)
+df <- data.frame(top_named_1, names(top_named_1))
+colnames(df) <- c("gene", "cluster")
+df %>% dplyr::filter (cluster == "11") %>% dplyr::pull(gene)
+top_named_1["0"]
+
+```
+Update identities
+0 - epithelium
+1 - epithelium
+2 - epithelium
+3 - epithelium
+4 - epithelium 
+5 - plasma cells
+6 - T cells
+7 - Fibroblasts
+8 - T cells
+9 - endothelium
+10 - epithelium
+11 - glia/fibroblasts
+12 - macrophages
+13 - epithelium
+14 - fibroblasts
+15 - goblet cells (cGPT)
+16 - B cells (cGPT)
+17 - epithelium
+18 - ?glia? mast cells (cGPT)
+19 - macrophages
+20 - lymphatic endothelial cells (cGPT)
+
+```{r}
+seurat_CRC3 <- RenameIdents(seurat_CRC3, 
+                            `0` = "epithelium 1", 
+                            `1` = "epithelium 2",
+                            `2` = "epithelium 3",
+                            `3` = "epitheluim 4",
+                            `4` = "epithelium 5", 
+                            `5` = "plasma cells", 
+                            `6` = "T cells 1", 
+                            `7` = "fibroblasts 1",
+                            `8` = "T cells", 
+                            `9` = "endothelium", 
+                            `10` = "epithelium 6",
+                            `11` = "glia/fibroblasts", 
+                            `12` = "macrophages 1", 
+                            `13` = "epithelium", 
+                            `14` = "fibroblasts 2", 
+                            `15` = "goblet cells", 
+                            `16` = "B cells", 
+                            `17` = "epithelium 7", 
+                            `18` = "mast cells", 
+                            `19` = "macrophages 2", 
+                            `20` = "lymphatic endothelium")
+seurat_CRC3$cell_annotation_fine <- Idents(seurat_CRC3)
+ImageDimPlot(seurat_CRC3)
+```
+Make a broader annotation
+```{r}
+Idents(seurat_CRC3) <- seurat_CRC3$SCT_snn_res.1
+seurat_CRC3 <- RenameIdents(seurat_CRC3, 
+                            `0` = "epithelium", 
+                            `1` = "epithelium",
+                            `2` = "epithelium",
+                            `3` = "epithelium",
+                            `4` = "epithelium", 
+                            `5` = "plasma cells", 
+                            `6` = "T cells", 
+                            `7` = "fibroblasts",
+                            `8` = "T cells", 
+                            `9` = "endothelium", 
+                            `10` = "epithelium",
+                            `11` = "glia/fibroblasts", 
+                            `12` = "macrophages", 
+                            `13` = "epithelium", 
+                            `14` = "fibroblasts", 
+                            `15` = "goblet cells", 
+                            `16` = "B cells", 
+                            `17` = "epithelium", 
+                            `18` = "mast cells", 
+                            `19` = "macrophages", 
+                            `20` = "lymphatic endothelium")
+seurat_CRC3$cell_annotation_broad <- Idents(seurat_CRC3)
+ImageDimPlot(seurat_CRC3)
+```
+Where are the lymphatic endothelial cells?
+
+
+```{r}
+ImageDimPlot(seurat_CRC3, cells=WhichCells(seurat_CRC3, idents = "lymphatic endothelium"))
+```
+
+Save the object
+```{r}
+saveRDS(seurat_CRC3, file = paste0(directory, "/CRC3_subset_filtered_annotated.rds"))
+```
+
+For consistency we are going to use the annotations from the label transfer. 
+
+```{r}
+Idents(seurat_CRC3) <- seurat_CRC3$predicted.id
+```
+
+```{r}
+# set the colours
+library(scales)
+cell_colours <- hue_pal()(11)
+names(cell_colours) <- seurat_CRC3$predicted.id %>% unique()
+
+cell_colours <- c("#F8766D", "#DB8E00", "#AEA200", "#64B200", "#00BD5C", "#00C1A7", 
+                  "#00BADE", "#00A6FF", "#B385FF", "#EF67EB", "#FF63B6")
+names(cell_colours)  <- c("Epithelium", "Fibroblasts", "T-Cells",  "Myofibroblasts", "Macrophages", 
+                          "Glia", "Endothelium", "Telocytes", "Plasma", "B-Cells", "Pericytes")
+cell_colours
+ImageDimPlot(seurat_CRC3, cols = cell_colours)
+```
+
+## Integration
+
+Attempt to integrated the 3 cancer and 1 healthy sections. 
+
+```{r}
+seurat_CRC1 <- readRDS("/project/wolf1241/SHARED/spatial_data_camp/HACKATHON/the_bigger_fish/CRC1_annotation_new.rds")
+seurat_CRC2 <- readRDS("/project/wolf1241/SHARED/spatial_data_camp/HACKATHON/the_bigger_fish/seurat_CRC2_annot.RDS")
+seurat_healthy <- readRDS("/project/wolf1241/SHARED/spatial_data_camp/notebooks_and_code/DAY3_NOTEBOOKS/colon_in_situ.RDS")
+
+
+
+# add project names
+seurat_healthy@project.name <- "healthy"
+seurat_CRC1@project.name <- "CRC1"
+seurat_CRC2@project.name <- "CRC2"
+seurat_CRC3@project.name <- "CRC3"
+
+# add project names to metadata column
+seurat_healthy[[]]$orig.ident <- "healthy"
+seurat_CRC1[[]]$orig.ident <- "CRC1"
+seurat_CRC2[[]]$orig.ident <- "CRC2"
+seurat_CRC3[[]]$orig.ident <- "CRC3"
+
+
+# make a list
+so <- list(seurat_healthy, seurat_CRC1, seurat_CRC2, seurat_CRC3)
+
+for (i in seq(1:length(so))){
+  Idents(so[[i]]) <- so[[i]]$predicted.id
+}
+```
+
+
+Plot the unintegrated data
+
+Image plots
+
+```{r, fig.width=12, fig.height=10}
+p <- list()
+for (i in seq(1:length(so))){
+  p[[i]] <- ImageDimPlot(so[[i]], cols = cell_colours) + ggtitle(so[[i]]@project.name)+
+    theme(legend.position="none")
+}
+library(cowplot)
+plot_grid(plotlist = p)
+```
+
+
+Harmonise metadata
+
+```{r}
+# select harmonised columns
+columns_keep <-  c("orig.ident", "nCount_XENIUM", "nFeature_XENIUM", "cell_id", 
+                   "x_centroid", "y_centroid", "transcript_counts", "control_probe_counts", 
+                   "total_counts", "cell_area", "nucleus_area", "nCount_Negative.Control.Codeword", 
+                   "cell_nucleus_ratio",  "nCount_SCT", "nFeature_SCT", 
+                   "seurat_clusters", "predicted.id.score", "predicted.id")
+
+# keep these columns
+for (i in seq(1:length(so))){
+  so[[i]]@meta.data <- so[[i]]@meta.data[, columns_keep]
+  print(so[[i]]@project.name)
+  print(colnames(so[[i]][[]]))
+}
+
+
+```
+
+Merge the list of objects
+
+```{r}
+
+so_merge <- merge(so[[1]], so[-1])
+so_merge
+```
+Fields of view to use:
+Healthy = COLON
+CRC1 = COLO_CAN
+CRC2 = COLONC2
+CRC3 = COLORECTAL_CANCER
+
+
+```{r}
+# harmonise field of view names
+so_merge[["HEALTHY"]] <- so_merge[["COLON"]]
+so_merge[["COLON"]] <- NULL 
+so_merge[["CRC1"]] <- NULL
+so_merge[["CRC1"]] <- so_merge[["COLO_CAN"]]
+so_merge[["COLO_CAN"]] <- NULL
+so_merge[["CRC2"]] <- so_merge[["COLONC2"]]
+so_merge[["COLONC2"]] <- NULL
+so_merge[["CRC3"]] <- so_merge[["COLORECTAL_CANCER"]]
+so_merge[["COLORECTAL_CANCER"]] <- NULL
+so_merge[["HEALTHY_ZOOM"]] <- so_merge[["ROI1"]]
+so_merge[["ROI1"]] <- NULL
+so_merge
+```
+
+```{r}
+ImageDimPlot(so_merge, fov = "CRC1", cols = cell_colours)
+
+```
+Process the merged data
+
+```{r}
+# split the merged object by the variable we want to integrate over
+
+#so_merge[["XENIUM"]] <- split(so_merge[["XENIUM"]], f = so_merge$orig.ident)
+
+so_merge <- SCTransform(so_merge, assay = "XENIUM")
+so_merge <- RunPCA(so_merge)
+so_merge <- FindNeighbors(so_merge, reduction = "pca", dims = 1:20)
+so_merge <- FindClusters(so_merge, resolution = .5, cluster.name = "unintegrated_clusters")
+so_merge <- RunUMAP(
+          so_merge,
+          reduction = "pca",
+          dims = 1:20,
+          return.model = T,
+          verbose = F,
+          reduction.name = "umap"
+        )
+
+
+```
+
+
+Integrate using harmony
+
+```{r}
+
+
+so_harmony <- IntegrateLayers(
+          so_merge,
+          method = HarmonyIntegration,
+          orig = "pca",
+          new.reduction = "harmony",
+          normalization.method = "SCT"
+          )
+
+so_harmony <- FindNeighbors(so_harmony, reduction = "harmony", dims = 1:20)
+so_harmony <- FindClusters(so_harmony, resolution = .5, cluster.name = "integrated_clusters")
+so_harmony <- RunUMAP(
+          so_harmony,
+          reduction = "harmony",
+          dims = 1:20,
+          return.model = T,
+          verbose = F,
+          reduction.name = "integrated.umap"
+        )
+```
+## Save objects
+
+```{r}
+saveRDS(so_merge, file = paste0(directory, "/CRC_merge.rds"))
+saveRDS(so_harmony, file = paste0(directory, "/CRC_harmony.rds"))
+```
+
+
+
+#### Visualise the merged and integrated umaps
+
+Plot by clusters
+```{r, fig.width=10, fig.height=4}
+p1 <- DimPlot(so_merge, reduction = "umap", group.by = "unintegrated_clusters")
+p2 <- DimPlot(so_harmony, reduction = "integrated.umap", group.by = "integrated_clusters")
+plot_grid(p1, p2)
+```
+
+Plot by orig.ident
+```{r, fig.width=10, fig.height=4}
+p1 <- DimPlot(so_merge, reduction = "umap", group.by = "orig.ident")+ggtitle("merged")
+p2 <- DimPlot(so_harmony, reduction = "integrated.umap", group.by = "orig.ident")+ ggtitle("integrated")
+plot_grid(p1, p2)
+```
+
+#### Visualise the merged and integrated spatial data
+
+```{r, fig.width=12, fig.height=8}
+p1 <- ImageDimPlot(so_merge, group.by="unintegrated_clusters",fov = "HEALTHY")+
+    theme(legend.position="none")+ ggtitle("healthy")
+p2 <- ImageDimPlot(so_merge, group.by="unintegrated_clusters",fov = "CRC1")+
+    theme(legend.position="none")+ ggtitle("CRC1")
+p3 <- ImageDimPlot(so_merge, group.by="unintegrated_clusters",fov = "CRC2")+
+    theme(legend.position="none")+ ggtitle("CRC2")
+p4 <- ImageDimPlot(so_merge, group.by="unintegrated_clusters",fov = "CRC3")+
+    theme(legend.position="none")+ ggtitle("CRC3")
+plot_grid(p1, p2, p3, p4)
+```
+
+```{r, fig.width=12, fig.height=8}
+p1 <- ImageDimPlot(so_harmony, group.by="integrated_clusters",fov = "HEALTHY")+
+    theme(legend.position="none")+ ggtitle("healthy")
+p2 <- ImageDimPlot(so_harmony, group.by="integrated_clusters",fov = "CRC1")+
+    theme(legend.position="none")+ ggtitle("CRC1")
+p3 <- ImageDimPlot(so_harmony, group.by="integrated_clusters",fov = "CRC2")+
+    theme(legend.position="none")+ ggtitle("CRC2")
+p4 <- ImageDimPlot(so_harmony, group.by="integrated_clusters",fov = "CRC3")+
+    theme(legend.position="none")+ ggtitle("CRC3")
+plot_grid(p1, p2, p3, p4)
+```
+
+## Label transfer
+
+Transfer the labels from the ref single cell datasets
+
+
+THis is not working yet
+
+Error from PrepSCTFindMarkers: Multiple UMI assays are used for SCTransform: XENIUM, RNA
+I think this might be why the FindTransferAnchors isn't working. 
+Need to go back and check how I ran the SCT on the merged and integrated objects. 
+
+```{r}
+
+# need to merge the SCT assays (?)
+so_test <- PrepSCTFindMarkers(so_harmony, assay = "SCT", verbose = TRUE)
+
+
+anchors <- FindTransferAnchors(reference = ref, 
+                               query = so_harmony, 
+                               #normalization.method = "SCT"
+                               #reduction = "harmony", 
+                               reference.reduction = "pca",)
+
+seurat_CRC3 <- TransferData(anchorset = anchors, 
+                       refdata = ref$CellType, 
+                       prediction.assay = TRUE,
+                       weight.reduction = seurat_CRC3[["pca"]], 
+                       query = seurat_CRC3, 
+                       dims=1:30)
+
+```
+
+

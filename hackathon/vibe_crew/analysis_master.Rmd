@@ -1,0 +1,227 @@
+---
+title: "Team Vibe Crew analysis"
+output: html_notebook
+---
+
+# Load the required libraries
+```{r setup}
+library(Seurat)
+library(ggplot2)
+library(scCustomize)
+library(readr)
+library(pheatmap)
+library(matrixStats)
+library(spdep)
+library(geojsonR)
+library(SingleCellExperiment)
+library(scuttle)
+```
+
+# Prepare the Xenium seurat object
+```{r Load, eval=FALSE}
+start <- Sys.time()
+
+data_dir <- "/project/shared/spatial_data_camp/datasets/DATASET3/XENIUM_5K_LYMPH_NODE"
+
+data <- ReadXenium(data_dir, outs = "matrix", type=c("centroids", "segmentations"))
+
+end <- Sys.time()
+```
+
+```{r Benchmark, eval=FALSE}
+paste0("Time to read in the data: ", round(end - start, 2), " mins")
+```
+
+```{r Metadata, eval=FALSE}
+cell_meta_data <- read.csv(file.path(data_dir, "cells.csv.gz"))
+annot <- read_csv("/project/shared/spatial_data_camp/HACKATHON/vibe_crew/Xenium_Prime_Human_Lymph_Node_Reactive_FFPE_cell_types.csv")
+
+cell_meta_data <- merge(cell_meta_data, annot, by = "cell_id")
+remove(annot)
+
+head(cell_meta_data)
+```
+
+```{r, eval=FALSE}
+seurat <- CreateSeuratObject(counts = data$matrix[["Gene Expression"]],
+                                 assay = "XENIUM",
+                                 meta.data = cell_meta_data)
+
+seurat[["Negative.Control.Codeword"]] <- CreateAssayObject(counts = data$matrix[["Negative Control Codeword"]])
+seurat[["Negative.Control.Probe"]] <- CreateAssayObject(counts = data$matrix[["Negative Control Probe"]])
+seurat[["Unassigned.Codeword"]] <- CreateAssayObject(counts = data$matrix[["Unassigned Codeword"]])
+
+coords <- CreateFOV(coords = list(centroids = CreateCentroids(data$centroids), 
+                                  segmentation = CreateSegmentation(data$segmentations)),
+                    type = c("segmentation", "centroids"),
+                    assay = "XENIUM")
+seurat[["LN"]] <- coords
+```
+
+```{r Delete unused objects and purge, eval=FALSE}
+remove(list = list(data, coords, annot, cell_meta_data, start, end))
+gc()
+```
+
+```{r Save/load pre-computed object}
+#saveRDS(seurat, file = "/project/shared/spatial_data_camp/HACKATHON/vibe_crew/01_xenium_with_annot_and_fov_and_neg_probes.RDS")
+seurat <- readRDS(file = "/project/shared/spatial_data_camp/HACKATHON/vibe_crew/01_xenium_with_annot_and_fov_and_neg_probes.RDS")
+```
+
+```{r Rename celltype column}
+seurat$Celltype <- seurat$group
+seurat$group <- NULL
+```
+
+
+# Subset on the Xenium explorer outline
+
+```{r Read barcodes info}
+barcodes <- read_csv("/project/shared/spatial_data_camp/HACKATHON/vibe_crew/LN_whole_cells_stats.csv", skip = 2)
+colnames(barcodes) <- c("cell_id", "annotation", "no_transcripts", "area")
+```
+
+
+```{r Visualise filter}
+seurat$OUTLINE_FILTER <- seurat$cell_id %in% barcodes$cell_id
+ImageDimPlot(seurat, group.by="OUTLINE_FILTER")
+```
+
+```{r Subset, warning=FALSE}
+seurat <- subset(seurat, OUTLINE_FILTER)
+ImageDimPlot(seurat, group.by="OUTLINE_FILTER")
+```
+
+# Subset on the QC metrics
+
+```{r Select filtering method}
+method <- "MSD" #Select quantiles or MSD
+```
+
+```{r Define MSD outlier function}
+find_msd_outliers <- function(parameter, type, batch){
+  outlier <- isOutlier(parameter,
+                       nmads = 2.5,
+                       share.mads = F,
+                       type=type,
+                       batch=batch)
+  x <- as.vector(outlier)
+  names(x) <- names(outlier)
+  barcodes <- names( which(x == FALSE) )
+  return(barcodes)
+}
+```
+
+## Transcript number
+```{r}
+if(method == "quantiles"){
+  seurat$TRANSCRIPT_FILTER <- seurat$nCount_XENIUM >= 15
+  ImageDimPlot(seurat, group.by="TRANSCRIPT_FILTER")
+} else if (method == "MSD"){
+  high <- find_msd_outliers(seurat$nCount_XENIUM, "high", seurat$Celltype)
+  low <- find_msd_outliers(seurat$nCount_XENIUM, "low", seurat$Celltype)
+  seurat$TRANSCRIPT_FILTER <- seurat$cell_id %in% intersect(high, low)
+} else {
+  stop("Bad normalisation method")
+}
+ImageDimPlot(seurat, group.by="TRANSCRIPT_FILTER")
+```
+
+## Cell size (min and max)
+```{r}
+if(method =="quantiles"){
+  seurat[["SIZE_FILTER_SMALL"]] <- seurat$cell_area > quantile(seurat$cell_area, .1)
+  seurat[["SIZE_FILTER_LARGE"]] <- seurat$cell_area < quantile(seurat$cell_area, .99)
+} else if (method == "MSD"){
+  high <- find_msd_outliers(seurat$cell_area, "high", seurat$Celltype)
+  low <- find_msd_outliers(seurat$cell_area, "low", seurat$Celltype)
+  seurat$SIZE_FILTER_SMALL <- seurat$cell_id %in% low
+  seurat$SIZE_FILTER_LARGE <- seurat$cell_id %in% high
+} else {
+  stop("Bad normalisation method")
+}
+ImageDimPlot(seurat, group.by="SIZE_FILTER_SMALL")
+ImageDimPlot(seurat, group.by="SIZE_FILTER_LARGE")
+```
+
+## Negative probes
+```{r}
+seurat[['PROBE_FILTER']] <- seurat$nCount_Unassigned.Codeword == 0 &
+                       seurat$nCount_Negative.Control.Codeword == 0 &
+                       seurat$nCount_Negative.Control.Probe == 0
+```
+
+
+```{r Filter the object}
+seurat$COMBINED_FILTER <- seurat$PROBE_FILTER & seurat$SIZE_FILTER_SMALL & seurat$SIZE_FILTER_LARGE & seurat$TRANSCRIPT_FILTER
+#seurat$COMBINED_FILTER <- seurat$cell_id %in% msd_barcodes
+
+ImageDimPlot(seurat, group.by="COMBINED_FILTER")
+```
+
+```{r, warning=FALSE}
+seurat <- subset(seurat, COMBINED_FILTER)
+saveRDS(seurat, "/project/shared/spatial_data_camp/HACKATHON/vibe_crew/02_xenium_after_QC_filtering.RDS")
+```
+
+# Normalise the counts and calculate PC/UMAP
+
+```{r, eval=FALSE}
+seurat <- readRDS("/project/shared/spatial_data_camp/HACKATHON/vibe_crew/02_xenium_after_QC_filtering.RDS")
+```
+
+```{r Normalise and PCA}
+seurat <- SCTransform(seurat, assay = "XENIUM", clip.range = c(-10, 10))
+seurat <- RunPCA(seurat)
+```
+
+```{r}
+ElbowPlot(seurat, 50)
+```
+
+# Subset to a smaller object (just part of the lymph node)
+
+```{r, reading in the filtered object, eval=FALSE}
+seurat_small <- readRDS("/project/shared/spatial_data_camp/HACKATHON/vibe_crew/02_xenium_after_QC_filtering.RDS")
+```
+
+```{r Read fragment barcodes info}
+barcodes <- read_csv("/project/shared/spatial_data_camp/HACKATHON/vibe_crew/LN_subset_cells_stats.csv", skip = 2)
+colnames(barcodes) <- c("cell_id", "annotation", "no_transcripts", "area")
+head(barcodes)
+```
+
+```{r Subset to a fragment}
+seurat_small$SMALL_FRAGMENT_FILTER <- seurat_small$cell_id %in% intersect(seurat_small$cell_id,barcodes$cell_id)
+subset(seurat_small, group.by="SMALL_FRAGMENT_FILTER")
+ImageDimPlot(seurat_small, group.by = "SMALL_FRAGMENT_FILTER")
+```
+
+```{r Normalise and PCA seurat small}
+seurat_small <- SCTransform(seurat_small, assay = "XENIUM", clip.range = c(-10, 10))
+seurat_small <- RunPCA(seurat_small)
+gc()
+```
+
+```{r}
+ElbowPlot(seurat_small, 50)
+```
+
+Let's go for 30 PCs:
+```{r}
+seurat_small <- RunUMAP(seurat_small, dims = 1:30)
+seurat_small <- FindNeighbors(seurat_small, reduction = "pca", dims = 1:30)
+seurat_small <- FindClusters(seurat_small, resolution = 0.5)
+```
+
+```{r}
+DimPlot(seurat_small, label=T, repel=T)
+```
+
+```{r}
+ImageDimPlot(seurat_small, size=.5)
+```
+
+```{r save seurat_small as RDS}
+saveRDS(seurat_small, "/project/shared/spatial_data_camp/HACKATHON/vibe_crew/04_xenium_small_after_QC_filtering_norm_PCA.RDS")
+```

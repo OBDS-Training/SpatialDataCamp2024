@@ -1,0 +1,907 @@
+---
+title: "Visium Spatial Transcriptomics Data Analysis - COVID - Dataset 4"
+output:
+  html_document:
+    df_print: paged
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+First we need to set up the environment and load the packages we will use for this workshop.
+
+```{r Setting up the environment}
+library(Seurat)
+library(ggplot2)
+library(DropletUtils)
+library(SpotClean)
+library(SpatialExperiment)
+library(scCustomize)
+library(clustree)
+library(CARD)
+library(MuSiC)
+library(corrplot)
+library('readxl')
+library(readr)
+```
+
+##LOADING DATA
+
+
+```{r Loading Data}
+
+visium_dir <- "/project/shared/spatial_data_camp/datasets/DATASET4/COVID_DUAL_SEQ_VISIUM/"
+metadata   <- read.csv('/project/shared/spatial_data_camp/HACKATHON/the_ogs/file_show.csv')
+meta_covid_no <- subset(metadata, viral_probes == 'no' & sample_type == 'covid')
+samples       <- meta_covid_no$folder
+
+seurat_covid_no <- list()
+
+# Load the data (.h5) and the tissue coordinates. If you want to get the coordinates from the a function: GetTissueCoordinates(seurat_covid_no_obj)
+
+for (id in 1:nrow(meta_covid_no)) {
+  
+  seurat_covid_no[[id]] <- Load10X_Spatial(data.dir= paste0(visium_dir, samples[id], '/outs/'),
+                                           slice = 'covid_no',
+                                           filename = "raw_feature_bc_matrix.h5",
+                                           filter.matrix = FALSE)
+  
+  coords <- read.csv(file.path(paste0(visium_dir,samples[id],'/outs/spatial/tissue_positions_list.csv')), header = F)
+  rownames(coords) <- coords$V1
+  seurat_covid_no[[id]]$UnderTissue     <- ifelse(coords[Cells(seurat_covid_no[[id]]), "V2"], 
+                                   yes="Under_Tissue", 
+                                   no="Outside_Tisue")
+
+# Visualise the tissue position per sample
+SpatialDimPlot(seurat_covid_no[[id]], group.by="UnderTissue")
+  
+}
+
+
+
+```
+
+
+
+##QUALITY CONTROL BASICS
+
+
+This metric is commonly used in spatial transcriptomics to assess the complexity and quality of data at each spot.
+A high number of features (genes) may indicate areas with more complex or diverse cell types, while a low number might indicate poor-quality spots or regions with few active genes.
+
+Similar to the number of genes detected, we can also plot the number of molecules/UMIs detected per spot.Two metrics (features and molecules) should generally correlate.
+High molecule count and low gene count could mean that the spot is homogenous i.e. consists of only few cell types.
+
+Low molecule count and low gene count could mean that thee are data quality issues in those regions.
+This could be due to tissue quality, or non-optimal tissue permeabilisation or other technical issues.
+But, it could also correspond to low cell density regions - it is important to understand the structural composition of your samples before you throw any data away.
+In spatial transcriptomics, there is generally much more variability in QC metrics between different regions than between different cell types in scRNA-Seq data.
+
+
+```{r Visualising Gene Detection Rate}
+
+genes <- list()
+umis <- list()
+
+for (id in 1:nrow(meta_covid_no)) {
+  
+ genes[[id]] <-  SpatialFeaturePlot(seurat_covid_no[[id]], "nFeature_Spatial") 
+ umis[[id]] <-  SpatialFeaturePlot(seurat_covid_no[[id]], "nCount_Spatial")
+  
+}
+
+
+```
+
+
+The below code calculates some additional QC metrics- the percentage of ribosomal and mitochondrial gene expression per spot in a seurat object.
+This is a common practice in single-cell RNA-seq data analysis and can also be applied to spatial transcriptomics data, albeit with some considerations about its utility in this context.
+
+Ribosomal proteins (genes starting with "Rp") are involved in protein synthesis.
+In single-cell analysis, high ribosomal content can sometimes indicate stressed or rapidly proliferating cells, but in spatial transcriptomics, its interpretation might differ due to the complex tissue environment.
+
+The percentage of mitochondrial gene expression is often used as a quality control metric in single-cell RNA-seq.
+High mitochondrial content may indicate damaged or dying cells, but its interpretation in spatial data needs careful consideration.
+In spatial transcriptomics, this metric can be less straightforward but might still indicate regions of potential artefact or high metabolic activity.
+
+Another call to *SpatialFeaturePlot*, this time to visualise the percentage of mitochondrial and ribosomal gene expression.
+
+Generally, we would expect epithelial cells to have a higher mitochondrial gene count, but in this case it does not quite correspond to histology across all areas.
+
+
+*Add_Cell_QC_Metrics* is a function from the *scCustomize* package that automatically calculates and adds various QC metrics to a seurat_covid_no object.
+It streamlines the QC process by providing a set of commonly used metrics that are crucial for assessing the quality of single-cell data and are largely transferrable to spatial transcriptomics data.
+The metrics are added to the seurat object meta data.
+
+You can customise which metrics to calculate via specific arguments.
+
+Next, we will inspect spot complexity.
+This metric, stored as *log10GenesPerUMI* variable in the meta data, indicates the number of unique genes per molecule and it gives an indication of the diversity of the transcriptome captured in each spot.
+
+A higher value of *log10GenesPerUMI* suggests greater transcriptome complexity and richness, while lower values might indicate technical artefacts or regions with lower biological diversity.
+
+We can visualise this over the tissue slide, but also the distribution as a histogram.
+The latter is useful if we want to determine and explore any cut-off values.
+
+The below code visualises an alternative complexity metric, indicating the percentage of total unique molecules occupied by the top 50 most highly expressed genes per spot in a spatial transcriptomics dataset.
+This metric can offer insights into the complexity and quality of each spot's transcriptome, particularly highlighting regions with very low diversity.
+A high percentage indicates that a small number of genes dominate the transcriptome in that spot, suggesting low complexity.
+Conversely, a lower percentage suggests a more diverse and complex transcriptome.
+
+As we would expect, the complexity of (most) spots outside the tissue covered area is very low and under tissue (mostly) high.
+
+We can use the values of QC metrics outside tissue as a guide to identify poor-quality spots under tissue.
+
+The below code snippet additionally explores the spatial distribution of various pathway scores.
+These scores, such as oxidative phosphorylation (oxphos), apoptosis (apop), DNA repair, and immediate-early gene expression (ieg), can serve as quality control metrics but again often highlight real biological phenomena in tissue sections.
+Understanding the context and implications of these scores is crucial for accurate interpretation. In this case, as it is FFPE probe-based, they won't be picked up, so remove them from the QC.
+
+High expression of IEGs is sometimes associated with post-mortem artefacts, as cells may exhibit stress responses shortly after death.
+
+Epithelial cells often have higher mitochondrial content, leading to higher oxidative phosphorylation scores.
+This can be an indicator of cellular metabolism and energy requirements.
+
+
+```{r Calculating Addition QC Metrics}
+
+GenesPerUM <- list()
+top50 <- list()
+
+for (id in 1:nrow(meta_covid_no)) {
+  seurat_covid_no[[id]] <- Add_Cell_QC_Metrics(seurat_object = seurat_covid_no[[id]],
+                                species = "human", 
+                                assay = "Spatial", 
+                                overwrite = TRUE,
+                                add_cell_cycle = FALSE,
+                                add_IEG = F,
+                                add_MSigDB = F
+                                )
+  
+
+  GenesPerUM[[id]] <- SpatialFeaturePlot(seurat_covid_no[[id]], "log10GenesPerUMI" ) +
+  QC_Histogram(seurat_covid_no[[id]], features = "log10GenesPerUMI")
+  
+ top50[[id]] <- SpatialFeaturePlot(seurat_covid_no[[id]], "percent_top50" ) +
+  QC_Histogram(seurat_covid_no[[id]], features = "percent_top50")
+  
+  
+}
+
+```
+
+The code snippet below creates a filter to identify problematic spots based on the number of detected genes and visualises which spots would be kept and which filtered out.
+At the current threshold, this would remove a small handful of poor quality spots from under tissue areas.
+
+In this case, we can also see that many spots outside the tissue covered area also pass this QC filter!
+
+**Which additional QC metrics would you use to create a more robust filter?** **Which thresholds would be most appropriate to use?**
+
+```{r Visualising scCustomize Metrics 2}
+
+# Get the threshold for the filtering step by plotting the n features.
+
+genes_threshold <- list()
+for (id in 1:nrow(meta_covid_no)) {
+  
+ genes_threshold[[id]] <- SpatialFeaturePlot(seurat_covid_no[[id]], "nFeature_Spatial") + QC_Histogram(seurat_covid_no[[id]], features = "nFeature_Spatial")
+
+}
+
+threshold <- c(500, 200, 200, 500, 500)
+
+
+for (id in 1:nrow(meta_covid_no)) {
+  seurat_covid_no[[id]]$SpotFilter <- seurat_covid_no[[id]]$nFeature_Spatial > threshold[id] 
+  
+}
+
+```
+
+
+
+R package SpotClean (See reference publication: <https://www.nature.com/articles/s41467-022-30587-y>) can help us deal with contamination between spots somewhat.
+
+The below code snippet will incorporate a decontamination step into our workflow.
+
+it corrects for RNA diffusion and background contamination, then creates a new assay called SPOTCLEAN in the seurat object using the decontaminated data from SpotClean.
+By adding the corrected counts as a new assay, we can preserve both raw and corrected data in the seurat object and compare the two.
+
+```{r}
+
+
+s <- file.path(gsub('/$', x = visium_dir, replacement = ''), samples)
+
+for (id in 1:nrow(meta_covid_no)) {
+se <- read10xVisium(s[id], data="raw")
+se <- spotclean(se, 
+                gene_keep = rownames(se), 
+                gene_cutoff = 0)
+  
+clean <- assays(se)[["decont"]]
+rownames(clean) <- rowData(se)$symbol 
+  
+seurat_covid_no[[id]][["SPOTCLEAN"]] <- CreateAssayObject(clean)
+}
+
+
+```
+
+Next, we visualise decontamination effects on total UMI or gene counts.
+Overall, it is not a big effect.
+
+```{r}
+p1 <- SpatialFeaturePlot(seurat_covid_no, features = "nFeature_Spatial")
+p2 <- SpatialFeaturePlot(seurat_covid_no, features = "nFeature_SPOTCLEAN")
+
+p1 + p2
+```
+
+To examine the effects on individual genes, we first normalise the data to library size in both the original data and the decontaminated data.
+
+Here, we use a quick log normalisation and library size scaling function in seurat, which normalises the gene expression data within a specified assay.
+By default, it scales counts for each spot by the total expression, multiplies by a scale factor (usually 10,000), and then log-transforms the result.
+
+
+```{r}
+
+for (id in 1:nrow(meta_covid_no)) {
+ seurat_covid_no[[id]] <- subset(seurat_covid_no[[id]], UnderTissue == 'Under_Tissue' & SpotFilter)
+  seurat_covid_no[[id]] <- SCTransform(seurat_covid_no[[id]], assay="Spatial", return.only.var.genes = FALSE)
+   
+}
+
+seurat_covid_no <- NormalizeData(seurat_covid_no, assay = "Spatial")
+seurat_covid_no <- NormalizeData(seurat_covid_no, assay="SPOTCLEAN")
+```
+
+Let's explore how to visualise the effects of SpotClean decontamination on the expression of individual genes, using the highly expressed gene Myh11 as an example.
+Myh11 (Myosin heavy chain 11) is typically expressed in the muscularis mucosa layer of the intestine, and we aim to assess how decontamination affects its expression pattern across the tissue.
+
+*DefaultAssay* sets the active assay for a seurat_covid_no object.
+This determines which data is accessed for functions like plotting and analysis and allows us to switch between corrected and uncorrected gene expression values.
+
+We can see that correcting for diffusion artefacts results in much cleaner signal that reflects tissue histology better.
+
+However, we always need to be careful when applying these types of approaches as potentially we can accidentally also remove some real biological signal.
+It is always worth comparing outcomes from corrected and uncorrected analyses.
+
+**Which other genes have been corrected?**
+
+```{r}
+gene <- "Myh11"
+
+DefaultAssay(seurat_covid_no) <- "Spatial"
+p1 <- SpatialFeaturePlot(seurat_covid_no, features = gene)
+DefaultAssay(seurat_covid_no) <- "SPOTCLEAN"
+p2 <- SpatialFeaturePlot(seurat_covid_no, features = gene)
+
+p1 + p2
+```
+
+##CLUSTERING ANALYSIS
+
+To ensure that cluster analysis in spatial transcriptomics data is performed on high-quality spots, it's essential to remove spots not under tissue and those that are low quality.
+
+The code snippet below subsets the seurat_covid_no object based on specific criteria.
+
+*UnderTissue == "Under Tissue"*: Filters spots to retain only those identified as being under tissue.
+This is based on metadata indicating which spots are genuinely covered by tissue, helping to exclude background or artefactual spots.
+
+*SpotFilter*: A logical vector that was previously defined to include only spots with more than 1,500 detected genes.
+This ensures that spots with low feature counts, which could be artefacts or of lower quality, are excluded from the analysis.
+
+**Did you include any additional QC metrics in the filter?**
+
+```{r}
+seurat_covid_no <- subset(seurat_covid_no, UnderTissue == "Under Tissue" & SpotFilter )
+```
+
+As the first step for clustering analysis, lets discuss how to normalise spatial transcriptomics data.
+
+*SCTransform* is an advanced normalisation method in seurat_covid_no that models gene expression data using regularised negative binomial regression.
+It accounts for sequencing depth and other confounding factors, providing a robust framework for normalising single-cell and spatial transcriptomics data.
+This tends to perform a bit better than log normalisation approach used above.
+
+*assay = "SPOTCLEAN"*: Specifies the assay to be normalised.
+Here, we focus on the SpotClean-corrected data but we could use the uncorrected values instead.
+
+```{r}
+seurat_covid_no <- SCTransform(seurat_covid_no, assay="SPOTCLEAN", return.only.var.genes = FALSE)
+```
+
+We can visualise both raw counts values and normalised values using Myh11 expression as an example:
+
+```{r}
+gene <- "Myh11"
+p1 <- SpatialFeaturePlot(seurat_covid_no, gene, slot="data") # Normalised counts
+p2 <- SpatialFeaturePlot(seurat_covid_no, gene, slot="counts") # Raw counts
+
+p1 + p2
+```
+
+Reducing dimensionality is a crucial step in the analysis of high-dimensional spatial transcriptomics data.
+It simplifies the data structure while retaining its most informative features, which is essential for tasks such as clustering, visualisation, and identifying patterns of gene expression across spots.
+Here, we'll go through the process of running Principal Component Analysis (PCA) on a seurat_covid_no object.
+
+PCA reduces the dimensionality of the dataset by transforming it into a set of orthogonal axes, known as principal components (PCs), which capture the most variance in the data.
+This process helps in identifying and focusing on the most informative features, filtering out noise and redundancy.
+
+*RunPCA* is a function in seurat_covid_no that performs PCA on the data stored within a seurat_covid_no object, typically after normalisation and identification of variable features.
+PCA is often the first step in a series of dimensionality reduction techniques used to prepare the data for clustering and visualisation.
+
+Output: The seurat_covid_no object is updated with the computed principal components, which are stored for further analysis and visualisation.
+This includes the loading matrix, which shows how each feature contributes to the principal components.
+Top positive and negative loading genes for each PC are automatically printed out.
+
+```{r}
+seurat_covid_no <- RunPCA(seurat_covid_no)
+```
+
+After PCA, we need to decide how many PCs to use for clustering and further analyses:
+
+*ElbowPlot* function in seurat_covid_no is a valuable tool for determining the number of PCs to include in downstream analyses, such as clustering or UMAP visualisation.
+By plotting the percentage of variance explained by each PC, it helps identify the point at which additional PCs contribute minimal additional variance---often referred to as the "elbow" of the plot.
+
+```{r}
+ElbowPlot(seurat_covid_no, 50)
+```
+
+Biological Relevance: Also consider biological knowledge and visual inspection of PCA plots to ensure that selected PCs capture relevant patterns.
+
+We can achieve this by visualising gene loadings of each PC to understand what kind of biological variation they capture.
+
+PC 1: Might highlight major tissue regions or dominant cell types - OR, dominant technical effects.
+PC 10: Could reflect variation related to specific cellular processes or less prominent tissue structures.
+PC 30: Might capture noise or subtle patterns, like rare cell states or technical variations.
+
+**What biological processes are reflected in the top PCs? Can you tell just from the gene loadings?**
+
+```{r fig.height=10, fig.width=7}
+PC_Plotting(seurat_covid_no, dim_number = 1)
+PC_Plotting(seurat_covid_no, dim_number = 10)
+PC_Plotting(seurat_covid_no, dim_number = 30)
+```
+
+The below code visualises PCs and histological features using the *SpatialFeaturePlot* function in seurat_covid_no.
+This approach helps link the dimensionality reduction results back to the tissue's spatial and histological context.
+
+```{r}
+SpatialFeaturePlot(seurat_covid_no, "PC_1", pt.size.factor = 2)
+SpatialFeaturePlot(seurat_covid_no, "PC_10", pt.size.factor = 2)
+```
+
+Finding clusters in spatial transcriptomics data is a crucial step for identifying groups of spots with similar expression profiles, which can correspond to different cell types or functional regions within the tissue.
+
+*FindNeighbors*: This step identifies nearest neighbors for each spot based on the selected PCs.
+It establishes the underlying graph structure used for clustering.
+The choice of PCs affects the quality of clustering.
+Too few PCs might miss important variations, while too many might introduce noise.
+
+*FindClusters*: Using the graph created in the previous step, the clustering algorithm partitions the spots into distinct groups.
+The resolution parameter determines the granularity of the clustering.
+
+Resolution Parameter *Resolution = 0.5*: This is a common starting point for many analyses, providing a balance between sensitivity and specificity.
+However, the optimal resolution varies based on dataset complexity and biological context.
+
+Higher Resolution: Leads to more, smaller clusters.
+Useful for detailed analyses where subtle differences are biologically meaningful.
+
+Lower Resolution: Results in fewer, larger clusters.
+Suitable when you expect broader, more general differences in the data.
+
+```{r}
+seurat_covid_no <- FindNeighbors(seurat_covid_no, dims = 1:12)
+seurat_covid_no <- FindClusters(seurat_covid_no, resolution = .5)
+```
+
+Embedding spatial transcriptomics data using Uniform Manifold Approximation and Projection (UMAP) is a powerful way to visualise high-dimensional datasets in a two-dimensional space (or more - we can create 3D visualisations, for example, though that's mostly for fun).
+
+Preserve Structure: UMAP is designed to maintain both local and global data structures, which helps in visualising the relationships between data points accurately.
+
+Cluster Separation: UMAP often provides better separation of clusters than other methods, making it useful for identifying distinct groups within data.
+
+Scalability: UMAP is computationally efficient, allowing it to handle large datasets commonly found in spatial transcriptomics.
+
+*RunUMAP* computes UMAP embeddings for the data stored in the seurat_covid_no object, transforming it into a two-dimensional representation that can be easily visualised.
+
+```{r}
+seurat_covid_no <- RunUMAP(seurat_covid_no,  dims = 1:12)
+```
+
+Visualising transcriptome clusters is an essential step in spatial transcriptomics analysis, as it helps identify and interpret the distinct biological structures and cell populations within the tissue.
+
+*DimPlot* generates a plot of spots in a reduced-dimensionality space.
+This plot is coloured by cluster identity, allowing to visually assess the grouping and separation of clusters.
+
+```{r}
+DimPlot(seurat_covid_no, label=T, repel=T)
+```
+
+And alongside, we can visualise how the clusters correspond to tissue space and align with histology using *SpatialDimPlot* function, as before.
+
+**Do all clusters correspond with histology?** **Do some areas look over or under clustered?** **Do some clusters look like they may correspond to technical artefeacts? Would additional QC help?**
+
+```{r}
+SpatialDimPlot(seurat_covid_no, pt.size.factor = 2)
+```
+
+Clusters are stored in the meta data of the seurat_covid_no object, and automatically set as the current active identity of the object.
+
+```{r}
+head(seurat_covid_no)
+```
+
+The choice of cluster resolution in the FindClusters function significantly impacts the granularity of the resulting clusters.
+Let's explore the concept of clustering resolution and how to determine the optimal value for the analysis by trying high and low values.
+
+```{r}
+seurat_covid_no <- FindClusters(seurat_covid_no, resolution = .1)
+DimPlot(seurat_covid_no, label=T, repel=T)
+SpatialDimPlot(seurat_covid_no, pt.size.factor = 2)
+```
+
+```{r}
+seurat_covid_no <- FindClusters(seurat_covid_no, resolution = 1)
+DimPlot(seurat_covid_no, label=T, repel=T)
+SpatialDimPlot(seurat_covid_no, pt.size.factor = 2)
+```
+
+The clustree package is for visualising and assessing the stability of clusters obtained from different resolution settings in clustering analyses.
+It helps in understanding how clusters change across different resolutions and identifying stable clusters that persist, which can provide insights into the optimal clustering parameters for your spatial transcriptomics data.
+
+*clustree* function visualises the hierarchical relationships between clusters obtained at different resolutions.
+It provides a tree-like diagram where nodes represent clusters, and edges show how clusters split or merge as the resolution changes.
+
+Stable Clusters: Look for nodes that maintain a consistent presence across resolutions, indicating stable clusters.
+
+Dynamic Changes: Identify where clusters split or merge, offering insights into biological or technical drivers behind these changes.
+
+```{r fig.height=10, fig.width=7}
+clustree(seurat_covid_no)
+clustree(seurat_covid_no,  node_colour = "sc3_stability")
+```
+
+##IDENTIFYING MARKER GENES FOR SPATIAL REGIONS
+
+Identifying marker genes for spatial regions in spatial transcriptomics data is a crucial step in understanding the distinct biological characteristics of each cluster.
+The *FindMarkers* function in seurat_covid_no is commonly used for this purpose, allowing you to perform differential expression analysis to identify genes that are significantly enriched in specific clusters compared to others.
+
+**Available Tests for Differential Expression** The FindMarkers function supports several statistical tests for identifying marker genes.
+The choice of test depends on your data characteristics and analysis goals:
+
+*Wilcoxon Rank Sum Test (test.use = "wilcox")*:
+
+Default: This non-parametric test is the default in seurat_covid_no and is suitable for small sample sizes or non-normally distributed data.
+Use Case: Quick to run and useful when no confounding variables need to be adjusted.
+
+*Likelihood-Ratio Test for Single Cell Gene Expression (test.use = "bimod")*:
+
+Bimodality: Assumes gene expression is bimodally distributed.
+Use Case: Good for single-cell RNA-seq data with dropout events.
+
+*Student's t-test (test.use = "t")*:
+
+Parametric: Assumes data is normally distributed.
+Use Case: Suitable for large datasets where normality can be assumed.
+
+*Logistic Regression (test.use = "LR")*:
+
+Regression: Uses logistic regression to assess differential expression.
+Use Case: Useful for handling confounding variables.
+
+*Negative Binomial Generalized Linear Model (test.use = "negbinom")*:
+
+Counts: Suitable for count data with overdispersion.
+Use Case: Useful for spatial or single-cell data with count overdispersion and can handle confounding variables.
+
+*Poisson Generalized Linear Model (test.use = "poisson")*:
+
+Poisson: Assumes data follows a Poisson distribution.
+Use Case: Best for count data without overdispersion.
+
+*MAST (test.use = "MAST")*:
+
+Zero-inflation: Handles zero-inflated data effectively.
+Use Case: Particularly useful for single-cell RNA-seq data.
+
+*DESeq2 (test.use = "DESeq2")*:
+
+Normalization: Adjusts for library size and compositional bias.
+Use Case: Effective for bulk RNA-seq and spatial transcriptomics.
+
+**Parameter settings**
+
+*logfc.threshold*: Sets a threshold for the minimum log fold change required to be considered significant.
+Helps filter out genes with minor expression differences.
+
+*min.pct*: Specifies the minimum percentage of cells expressing the gene to be included in the analysis.
+Helps focus on biologically relevant genes.
+
+*min.diff.pct*: Minimum difference in the percentage of cells expressing the gene between the two groups.
+Useful for highlighting stark differences.
+
+The above parameters for spatial data generally should be lowered from defaults, which are tuned for single cell datasets.
+In ST data, these thresholds sometimes filter out a lot of meaningful gene expression that can be more sparse than in single cell data.
+
+*latent.vars*: Adjusts for latent variables or confounders in the data, such as batch effects or technical artefacts.
+
+```{r}
+markers.cl1 <- FindMarkers(seurat_covid_no, ident.1="1")
+```
+
+Inspect the top results:
+
+```{r}
+head(markers.cl1)
+```
+
+seurat_covid_no offers a variety of visualisation tools for exploring gene expression patterns and spatial distributions in spatial transcriptomics data.
+These tools provide views into how specific genes are expressed across clusters, conditions, or spatial regions.
+
+*VlnPlot* creates a violin plot to show the distribution of gene expression levels across clusters or other groupings.
+*group.by* Argument: Specifies which metadata grouping to use for the x-axis, such as clusters or tissue types.
+
+*FeaturePlot* plots the expression of a gene on a reduced-dimensionality plot, such as UMAP or PCA, highlighting where the gene is expressed in the cluster space.
+
+*SpatialFeaturePlot* visualises the spatial distribution of gene expression on a tissue section, highlighting the areas where a specific gene is expressed.
+
+```{r}
+SpatialFeaturePlot(seurat_covid_no, "Nr4a1")
+```
+
+```{r}
+VlnPlot(seurat_covid_no, "Nr4a1")
+```
+
+```{r}
+FeaturePlot(seurat_covid_no, "Nr4a1")
+```
+
+Using the FindAllMarkers function in seurat_covid_no is a convenient way to identify marker genes for all clusters in a single step.
+This function performs differential expression analysis for each cluster, comparing it to all other clusters, and compiles a list of significant markers for each cluster.
+The same arguements - e.g. different statistical tests - apply here.
+
+```{r}
+markers <- FindAllMarkers(seurat_covid_no)
+```
+
+```{r}
+head(markers)
+```
+
+scCustomize package provides a convenient helper function, *Extract_Top_Markers*, to extract the top marker genes for each cluster from the output of *FindAllMarkers*.
+This function simplifies the process of identifying and retrieving the most significant marker genes for analysis and visualisation.
+
+In this case, we are extracting the top five markers per cluster.
+
+```{r}
+top <- Extract_Top_Markers(markers, num_genes = 5, named_vector = FALSE, make_unique = TRUE)
+top
+```
+
+*Clustered_DotPlot* function from the *scCustomize* package provides a convenient and visually appealing way to display expression patterns of top marker genes across clusters using a dot plot.
+This function not only plots the expression data but also clusters the genes and groups for enhanced visual interpretation.
+This is an alternative to seurat_covid_no *DotPlot* function.
+
+*k = 8*: Determines the number of clusters for the hierarchical clustering of genes to enhance visual separation of expression patterns.
+
+```{r fig.height=10, fig.width=7}
+Clustered_DotPlot(seurat_covid_no, features = top, k=8)
+```
+
+##SPATIALLY VARIABLE FEATURES
+
+Finding spatially variable features in spatial transcriptomics data is an essential step for identifying genes with expression patterns that vary across spatial regions of the tissue.
+
+Identify Spatial Patterns: Detect genes that show spatially distinct expression patterns, revealing potential tissue structures or specialised regions.
+
+Biological Understanding: Spatially variable features can highlight key functional areas within the tissue, and highlight spatial heterogeneity.
+
+Further Analysis: We can use spatially variable features to improve clustering - this tends to yield results that correlate with histology better than variably expressed genes.
+
+The *FindSpatiallyVariableFeatures* function in seurat_covid_no allows you to detect such features using various methods, one of which is Moran's I, a measure of spatial autocorrelation.
+
+Moran's I is a measure of spatial autocorrelation, which quantifies the degree to which similar values occur near each other in a spatial dataset.
+It is widely used in spatial analysis to determine if there is a pattern in the spatial distribution of a particular variable, such as gene expression levels in spatial transcriptomics data.
+Moran's I helps identify spatially variable features that may be linked to biological structures or processes.
+
+Interpretation of Moran's I Range: Moran's I ranges from -1 to +1.
+
+Positive Values: Indicate positive spatial autocorrelation, meaning similar values cluster together in space.
+For example, regions with high expression levels are near other regions with high expression levels.
+
+Negative Values: Indicate negative spatial autocorrelation, meaning dissimilar values are adjacent.
+This might suggest alternating patterns or competitive interactions.
+
+Zero: Indicates no spatial autocorrelation, meaning the spatial distribution is random.
+
+Significance: The significance of Moran's I is often tested using a permutation test, which evaluates whether the observed value of Moran's I could occur by chance under a null hypothesis of spatial randomness.
+
+seurat_covid_no also wraps an alternative method *'markvariogram'*.
+
+A variogram is a function that describes how data variance changes with spatial distance.
+It is commonly used in geostatistics to model spatial dependencies and can reveal the scale and intensity of spatial patterns.
+In the context of spatial transcriptomics, a variogram quantifies how gene expression variance changes as a function of distance between tissue spots or cells.
+
+Mark variograms are a special type of variogram used for point processes where each point (or spatial unit) has an associated mark (e.g., gene expression level).
+The method analyses the spatial dependence of these marks to identify genes with significant spatial variability.
+
+Moran's I vs. Markvariogram: While Moran's I captures overall spatial autocorrelation, markvariograms focus on variance over distance, which can capture more detailed spatial structures.
+
+```{r}
+seurat_covid_no <- FindSpatiallyVariableFeatures(seurat_covid_no, assay = "SCT", selection.method = "moransi") # ~ 20 mins running time
+#pre-computed table is available as an RDS file here: /project/shared/spatial_data_camp/datasets/PRECOMPUTED/sp.var.genes.RDS
+```
+
+*SpatiallyVariableFeatures* function in seurat_covid_no is typically used to extract spatially variable features identified by methods like Moran's I or mark variogram.
+If this function is not working due to a bug or issue (like it is in the current version of seurat_covid_no we are using), you can directly access the information stored in the meta.features slot of the assay.
+
+```{r, eval=FALSE}
+SpatiallyVariableFeatures(seurat_covid_no, assay = "SCT", selection.method = "moransi" )
+```
+
+Columns in the output:
+
+*moransi.spatially.variable.rank*: Indicates the rank of the gene's spatial variability.
+Lower values suggest higher spatial variability.
+
+*moransi.spatially.variable.p.value*: Provides the p-value associated with the spatial variability test, indicating statistical significance.
+
+*moransi.spatially.variable*: A logical indicator of whether the gene is considered spatially variable based on a specified threshold.
+
+```{r}
+sp.var.genes <- seurat_covid_no@assays[["SCT"]]@meta.features
+sp.var.genes <- sp.var.genes[order(sp.var.genes$moransi.spatially.variable.rank), ]
+head(sp.var.genes)
+```
+
+**What do the most spatially variable genes look like?** **What about the least variable?**
+
+```{r}
+SpatialFeaturePlot(seurat_covid_no, "mt-Co3")
+SpatialFeaturePlot(seurat_covid_no, "Hmgcs2")
+```
+
+Clustering spatial transcriptomics data using spatially variable genes is often a better approach that often aligns more closely with histological features than traditional clustering methods based on variable genes.
+By focusing on genes that exhibit significant spatial variability, this approach highlights biologically meaningful patterns and structures in tissue architecture.
+By focusing on genes with spatial patterns, this approach minimises the impact of uniformly expressed or randomly varying genes, which can introduce noise into clustering solutions.
+
+Lets repeat the clustering analysis, but using spatially variable features only.
+
+```{r}
+seurat_covid_no <- SCTransform(seurat_covid_no, assay="Spatial", residual.features=rownames(sp.var.genes)[1:2000])
+seurat_covid_no <- RunPCA(seurat_covid_no)
+seurat_covid_no <- RunUMAP(seurat_covid_no, dims=1:12)
+seurat_covid_no <- FindNeighbors(seurat_covid_no, dims = 1:12)
+seurat_covid_no <- FindClusters(seurat_covid_no, resolution = .5)
+```
+
+Visualise the updated clustering solution.
+
+**How much does this approach change the previous clustering solution?**
+
+```{r}
+DimPlot(seurat_covid_no, label=T, repel=T)
+SpatialDimPlot(seurat_covid_no, pt.size.factor=2)
+```
+
+##CELL TYPE DECONVOLUTION
+
+Many ST platforms capture gene expression data at resolutions that encompass multiple cells within each spatial spot.
+In this case, each Visium spot is approximately 55 micrometres in diameter and can cover multiple cell types, particularly in dense or heterogeneous tissues.
+This mixing of cell types within a single spot poses a significant challenge for understanding the cellular composition and the spatial organisation of individual cell types.
+
+Cell type deconvolution is the process of estimating the proportions and types of different cells present within a mixed cell population, based on gene expression data.
+In the context of spatial transcriptomics, deconvolution methods aim to unravel the cellular composition of each spot by inferring which cell types are present and in what proportions.
+This process is crucial for interpreting the spatial organisation of cell types within tissues.
+
+Approaches to Cell Type Deconvolution Several computational approaches have been developed to perform cell type deconvolution in spatial transcriptomics data.
+These methods generally fall into two categories:
+
+Reference-Based Methods: These methods use reference expression profiles from single-cell RNA-seq datasets to infer the cell type composition of spatial spots.
+They typically involve algorithms that match the expression profiles of spots to those of known cell types.
+
+De Novo Methods: These methods do not rely on external reference datasets and instead use statistical models to infer transcriptional groups from the data directly.
+
+Considerations and Challenges:
+
+Resolution and Spot Size: The resolution of the spatial platform affects the accuracy of deconvolution.
+Smaller spot sizes generally yield more precise cell type compositions but may also capture fewer transcripts, leading to increased noise.
+
+Reference Data Quality: The choice and quality of the reference single-cell dataset significantly influence deconvolution accuracy.
+The reference must be well-annotated and relevant to the tissue being studied.
+The majority of available methods are reference-based and these tend to perform better than reference-free approaches, but this entirely hinges on using an appropriate reference.
+
+Reference Data Resolution: Many deconvolution algorithms struggle to accurately distinguish closely related cell types.
+e.g.
+T-Cell vs B-Cell is straightforward, but CD4+ T-Cell vs CD8+ T-Cell (or even finer subsets than that) predictions should be interpreted more cautiously.
+
+Here, we will use a reference-based method CARD.
+It is currently one of the best performing methods implemented in R, although many others are available.
+
+For additional documentation, see here: <https://yma-lab.github.io/CARD/>
+
+As a reference, we will use a mouse intestine scRNA-Seq dataset.
+We can read in this data from a previously prepared seurat_covid_no object.
+
+```{r}
+ref <- readRDS("/project/shared/spatial_data_camp/datasets/SINGLE_CELL_REFERENCES/mouse_hc_colon_ref.RDS")
+```
+
+Let's visualise the dataset - here, we can see that the dataset has all major epithelial, mesenchymal and immune cells present in the tissue.
+
+**What would happen if your reference was incomplete/missing key cell types?** **Try removing cell populations from the reference to see how incomplete references impact deconvolution**
+
+```{r}
+DimPlot(ref, label=T, repel=T)
+```
+
+*createCARDObject* function is used to initialise the CARD analysis pipeline.
+The function takes as input both single-cell RNA-seq data and spatial transcriptomics data, and it outputs an object that can be used for further deconvolution analysis.
+
+*sc_count* : This argument specifies the single-cell RNA-seq count matrix.
+It contains the gene expression data from the single-cell reference dataset.
+*LayerData(ref, assay = "RNA", layer = "counts")* retrieves the counts layer from the single-cell reference data stored in the ref seurat_covid_no object.
+
+*sc_meta* : This argument provides the metadata associated with the single-cell RNA-seq dataset.
+It typically includes annotations such as cell type labels and sample information.
+*ref[[]]* accesses the metadata for the ref seurat_covid_no object, which includes cell type annotations needed for deconvolution.
+
+*spatial_count* : This argument specifies the spatial transcriptomics count matrix, which contains the gene expression data for each spatial spot.
+*LayerData(seurat_covid_no, assay = "SCT", layer = "counts")* retrieves the counts layer from the seurat_covid_no object that contains spatial data.
+
+*spatial_location* : This argument provides the spatial coordinates of each spot in the spatial transcriptomics dataset.
+*GetTissueCoordinates(seurat_covid_no)* extracts the spatial coordinates of spots from the seurat_covid_no object.
+
+*ct.varname* : Specifies the column name in the scRNA-seq metadata that contains the cell type annotations.
+
+*ct.select* : This argument selects which cell types to include in the deconvolution process.
+*unique(ref\$CellType)* extracts all cell types names from the single-cell dataset.
+
+*sample.varname* : Specifies the column name in the scRNA-seq metadata that contains the sample identifiers, if the reference data is made up from multiple samples/batches.
+
+```{r}
+card <-  createCARDObject(
+	sc_count = LayerData(ref, assay = "RNA", layer = "counts"),
+	sc_meta = ref[[]],
+	spatial_count = LayerData(seurat_covid_no, assay = "SCT", layer = "counts"),
+	spatial_location = GetTissueCoordinates(seurat_covid_no),
+	ct.varname = "CellType",
+	ct.select = unique(ref$CellType),
+	sample.varname = "Sample",
+	minCountGene = 100,
+	minCountSpot = 5) 
+```
+
+The CARD deconvolution process aims to disentangle the mixed gene expression signals from spatial transcriptomics data by inferring the proportions of different cell types present in each spatial spot and is wrapped in *CARD_deconvolution* function.
+
+Outputs: The card object is updated with deconvolution results, including estimated cell type proportions for each spatial spot.
+This is a matrix where each row represents a spatial spot and each column represents a cell type, with values indicating the estimated proportion of each cell type in each spot.
+
+```{r}
+card <- CARD_deconvolution(CARD_object = card)
+```
+
+We can visualise the results using *CARD.visualize.pie* function.
+It creates pie charts for each spatial spot, representing the estimated proportions of different cell types within each spot.
+We can tweak the colours and other visual parameters.
+
+\*[card\@Proportion](mailto:card@Proportion){.email}\_CARD\* accesses the proportion matrix from the CARD object.
+Each row represents a spatial spot, and each column represents a cell type, with values indicating the estimated proportions.
+
+\*[card\@spatial](mailto:card@spatial){.email}\_location\* accesses the spatial location data stored in the CARD object.
+It provides the x y coordinates of each spot.
+
+```{r fig.height=10, fig.width=10}
+CARD.visualize.pie(
+	proportion = card@Proportion_CARD,
+	spatial_location = card@spatial_location)
+```
+
+Adding the predictions from the CARD deconvolution back into the seurat_covid_no object is a practical step to centralize your data and useful for further analysis.
+By storing the deconvolution results as a separate assay within the seurat_covid_no object, you can easily integrate cell type composition data with other analyses, such as visualisation, differential expression, and spatial plotting implemented in seurat_covid_no.
+
+```{r}
+seurat_covid_no[["predictions"]] <- CreateAssayObject(t(card@Proportion_CARD))
+```
+
+We can then plot the deconvolution results for individual cell types using the same seurat_covid_no functions as before.
+
+```{r}
+SpatialFeaturePlot(seurat_covid_no, "Enterocytes", pt.size.factor = 2)
+SpatialFeaturePlot(seurat_covid_no, "B-Cells", pt.size.factor = 2)
+SpatialFeaturePlot(seurat_covid_no, "T-Cells", pt.size.factor = 2)
+SpatialFeaturePlot(seurat_covid_no, "Myofibroblasts", pt.size.factor = 2)
+```
+
+```{r}
+FeaturePlot(seurat_covid_no, "Enterocytes")
+FeaturePlot(seurat_covid_no, "B-Cells")
+FeaturePlot(seurat_covid_no, "T-Cells")
+FeaturePlot(seurat_covid_no, "Myofibroblasts")
+```
+
+We can use all other standard seurat_covid_no visualisation functions with cell type probabilities - e.g. heatmap to visualise the distribution of cell types over spatial clusters or other groups.
+
+**How would you identify which cell types are enriched in which clusters/regions?** **What other seurat_covid_no functions/analyses could applied to cell type deconvolution results?**
+
+```{r}
+DefaultAssay(seurat_covid_no) <- "predictions"
+seurat_covid_no <- ScaleData(seurat_covid_no)
+DoHeatmap(seurat_covid_no, features=rownames(seurat_covid_no))
+```
+
+Plotting the correlation of cell type predictions across spatial spots can provide insights into which cell types tend to co-localise and which do not.
+This approach involves calculating the correlation matrix for the cell type proportions and visualising it using a correlation plot.
+Such an analysis can highlight potential interactions or spatial organisation patterns among different cell types within the tissue.
+
+A simple correlation based approach is quick to calculate, but only considers whether cell signatures are correlating within the same spots.
+In this case, because each spot represents multiple co-localising cells, the result is sensible.
+For higher resolution data or to consider longer range interactions, a different approach would be needed.
+We will explore this in more detail later in the workshop.
+
+```{r}
+correlation <- cor(as.matrix(t(GetAssayData(seurat_covid_no, assay="predictions"))))
+corrplot(correlation)
+```
+
+Correlation analyses allow us to look at the signatures in the same spots, but what if we want to ask questions about tissue areas that are adjacent to each other?
+
+Constructing a k-nearest neighbours graph based on spatial coordinates can be valuable for analysing spatial relationships.
+This allows you to explore various spatially related questions, such as identifying spatial domains, detecting spatial dependencies, and integrating spatial information into clustering or other analyses.
+
+```{r}
+coords <- GetTissueCoordinates(seurat_covid_no, which = "centroids")
+neighbours <- FindNeighbors(as.matrix(coords[, c("x", "y")]), k.param = 20, return.neighbor=TRUE)
+
+```
+
+For example, if we can use it automatically select spots that are adjacent or physically close to some feature of interest.
+In this case, we want to automatically select any spots that are nearby the group of spots which have been designated as cluster 8, which are the crypt top regions in the middle of the tissue swiss roll.
+
+Because of the rolled up nature of the tissue, it would be very hard to pick out this layer of spots "manually".
+
+This can be useful to explore how cells in adjacent spots might influence or interact with each other.
+
+In other use cases, you may want to select the tumour borders for example.
+
+*WhichCells* identifies the cells (or spots) that belong to a specific cluster or meet a particular expression criterion
+
+*TopNeighbors* finds the top n nearest neighbours for a given set of cells based on the k-NN graph.
+Increasing the n here will return more and more distal spots - tweak to your requirements!
+
+```{r}
+cells <- WhichCells(seurat_covid_no, expression= seurat_covid_no_clusters == 8)
+adjacent <- TopNeighbors(neighbours, cells, n = 6)
+
+Idents(seurat_covid_no) <- "Other Spots"
+seurat_covid_no <- SetIdent(seurat_covid_no, cells = adjacent, "Adjacent Spots")
+seurat_covid_no <- SetIdent(seurat_covid_no, cells = cells, "Spots of Interest")
+
+SpatialDimPlot(seurat_covid_no, pt.size.factor = 2)
+```
+
+We can then use these groups to find specific gene expression patterns - e.g. finding the differences between the two adjacent layers.
+
+```{r}
+DefaultAssay(seurat_covid_no) <- "SCT"
+diffs <- FindMarkers(seurat_covid_no, "Adjacent Spots", "Spots of Interest")
+head(diffs, 10)
+```
+
+```{r}
+VlnPlot(seurat_covid_no, "Saa1")
+```
+
+But we can also compare cell type deconvolution results in different layers.
+For example, we can see that the top layer of spots does not have a high Goblet cell signature, but the layer of spots we selected underneath does:
+
+```{r}
+VlnPlot(seurat_covid_no, "Goblets")
+```
+
+You can save your seurat_covid_no objects with all analyses as an RDS file to conveniently load it back up when needed or share with collaborators:
+
+```{r}
+saveRDS(seurat_covid_no, file="mouse_intestine_visium.RDS")
+```

@@ -1,0 +1,14 @@
+﻿sample_type,tissue,sub_array,viral_probes,slide_id,sample_id,folder
+covid,lung,B1,yes,V10B13-401,1C B1,1112417
+covid,lung,C1,no,V10B13-401,1C C1,1112418
+covid,lung,A1,no,V10B13-400,2C A1,1127394
+covid,lung,B1,no,V10B13-400,2C B1,1127395
+covid,lung,C1,yes,V10B13-400,2C C1,1127396
+covid,lung,A1,yes,V10L13-003,3C A1,1135331
+covid,lung,B1,yes,V10L13-003,3C B1,1135332
+covid,lung,C1,no,V10L13-003,3C C1,1135333
+covid,lung,D1,no,V10L13-003,3C D1,1135334
+control,lung,A1,yes,V10S29-080,4nC A1,1180172
+control,lung,B1,yes,V10S29-080,4nC B1,1180173
+control,lung,A1,yes,V10S29-079,5nC A1,1180176
+control,lung,B1,yes,V10S29-079,5nC B1,1180177

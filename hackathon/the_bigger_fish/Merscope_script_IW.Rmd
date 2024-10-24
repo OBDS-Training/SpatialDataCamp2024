@@ -1,0 +1,261 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is my script to try and analyse data from scratch - DATASET 2 -> MERSCOPE 
+
+```{r}
+library(Seurat)
+library(ggplot2)
+library(scCustomize)
+library(readr)
+library(pheatmap)
+library(matrixStats)
+library(spdep)
+library(geojsonR)
+```
+
+# Read in DAta 
+```{r}
+data_dir <- "/project/shared/spatial_data_camp/datasets/DATASET2/MERSCOPE_COLORECTAL_CANCER/"
+# can use load function from seurat instead
+# data <- ReadVizgen(data_dir)
+
+
+# Don't load segmentation boundariers just load cell x gene matric and centroid = skip the transcripts 
+
+# put type = centoids to prevent reading hdf5 files which takes ages 
+data <- ReadVizgen(data_dir, molecules=NA, type ='centroids')
+
+#?LoadVizgen
+cell_metadata = read.csv('/project/shared/spatial_data_camp/datasets/DATASET2/MERSCOPE_COLORECTAL_CANCER/cell_metadata.csv')
+# now add metadata to object 
+#cell_metadata
+cell_metadata
+dim(data$transcripts)
+
+# This is gene expression matrix 
+data$transcripts
+
+# Make the seurat object 
+#?CreateSeuratObject
+seurat <- CreateSeuratObject(counts = data$transcripts,
+                                 assay = "MERSCOPE",
+                                 meta.data = cell_metadata)
+
+
+# set the rownames of the cells in the dataobject to the cell ids 
+rownames(data$centroids) <- data$centroids$cell
+
+# Add the image slot to the object - we've left out the segmentation data as it took ages to load 
+# centroids = CreateCentroids(data$centroids[Cells(seurat),] - here we have reordered the cells in the data$centroids to be the # same as the order of cells in the seurat object - if you don't do this you get a wierd tiling image when try to plot a subset
+coords <- CreateFOV(coords = list(centroids = CreateCentroids(data$centroids[Cells(seurat),])),
+                    type = c("centroids"),
+                    assay = "MERSCOPE")
+
+seurat[["COLON"]] <- coords  # adding image has a warning check the image to see what it looks like 
+ImageDimPlot(seurat,fov='COLON')
+
+# Mark the blank probes that are detected in each cell - don't think we have the other codeword categories that are present 
+seurat[["Negative.Control.Codeword"]] <- CreateAssayObject(counts =data$transcripts[grepl('Blank',rownames(data$transcripts)),])
+```
+
+```{r}
+ImageFeaturePlot(seurat, "nCount_MERSCOPE", axes = T) + scale_fill_viridis_c()
+```
+```{r}
+# crop only does image, not dataset
+#cropped <- Crop(seurat[["COLON"]], x = c(8000, 11000), y = c(2500, 5500), coords = "plot")
+#seurat[["ROIIW"]] <- cropped
+
+# MERSCOPE CELL GETS read in as an integer but the integers are too big - need to read in cell ids as character so use tidyverse to read in set as character
+global_coordinates <- data.frame(seurat@images$COLON$centroids)
+global_coordinates
+
+## This does not work - need to order correctly 
+seurat$global_X <- global_coordinates$x
+seurat$global_Y <- global_coordinates$y
+seurat_subset <- seurat[,seurat$global_X < 11000 & seurat$global_X > 8000 & seurat$global_Y < 5500 & seurat$global_Y > 2500]
+```
+
+```{r}
+ImageFeaturePlot(seurat_subset, "nCount_MERSCOPE", axes = T) + scale_fill_viridis_c()
+```
+
+```{r}
+ImageFeaturePlot(seurat_subset, "nFeature_MERSCOPE") + scale_fill_viridis_c()
+```
+
+```{r}
+ggplot(seurat_subset[[]], aes(nFeature_MERSCOPE)) + geom_density()
+```
+
+```{r}
+ImageFeaturePlot(seurat_subset, "volume") + scale_fill_viridis_c()
+```
+
+```{r}
+ggplot(seurat_subset[[]], aes(volume)) + geom_density()
+```
+
+```{r}
+ggplot(seurat_subset[[]], aes(nCount_MERSCOPE, volume)) + geom_point()
+```
+
+```{r}
+seurat_subset[["SIZE_FILTER_LARGE"]] <- seurat_subset$volume < quantile(seurat_subset$volume, .99)
+ImageDimPlot(seurat_subset, group.by="SIZE_FILTER_LARGE")
+```
+
+```{r}
+seurat_subset[["SIZE_FILTER_SMALL"]] <- seurat_subset$volume > quantile(seurat_subset$volume, .01)
+ImageDimPlot(seurat_subset, group.by="SIZE_FILTER_SMALL")
+```
+
+```{r}
+p1 <- VlnPlot(seurat_subset, "nFeature_MERSCOPE", group.by = "SIZE_FILTER_SMALL", pt.size = .1, alpha = .5) + labs(title="Small Cell Filter")
+p2 <- VlnPlot(seurat_subset, "nFeature_MERSCOPE", group.by = "SIZE_FILTER_LARGE", pt.size = .1, alpha = .5)+ labs(title="Large Cell Filter")
+p1 + p2
+```
+```{r}
+seurat_subset$TRANSCRIPT_FILTER <- seurat_subset$nCount_MERSCOPE >= 15
+ImageDimPlot(seurat_subset, group.by="TRANSCRIPT_FILTER")
+```
+```{r}
+ImageFeaturePlot(seurat_subset, "nCount_Negative.Control.Codeword") + scale_fill_viridis_c()
+```
+```{r}
+ImageFeaturePlot(seurat_subset, "nFeature_Negative.Control.Codeword") + scale_fill_viridis_c()
+```
+```{r}
+seurat_subset_filtered <- subset(seurat_subset, SIZE_FILTER_LARGE & SIZE_FILTER_SMALL & TRANSCRIPT_FILTER)
+seurat_subset_filtered <- SCTransform(seurat_subset_filtered, assay = "MERSCOPE", clip.range = c(-10, 10))
+seurat_subset_filtered <- RunPCA(seurat_subset_filtered)
+ElbowPlot(seurat_subset_filtered, 50)
+```
+
+```{r fig.height=6, fig.width=6}
+PC_Plotting(seurat_subset_filtered, dim_number = 8)
+```
+
+```{r}
+FeaturePlot(seurat_subset_filtered, "MRC1", reduction = "pca") + scale_color_viridis_c()
+```
+
+```{r}
+ImageFeaturePlot(seurat_subset_filtered, "PC_1") + scale_fill_viridis_c()
+```
+
+```{r}
+ImageFeaturePlot(seurat_subset_filtered, "MRC1", size=.5) + scale_fill_viridis_c()
+```
+#Add annotation
+```{r}
+ref <- readRDS("/project/shared/spatial_data_camp/datasets/SINGLE_CELL_REFERENCES/COLON_HC_5K_CELLS.RDS")
+ref
+DimPlot(ref)
+ref <- SCTransform(ref, residual.features =rownames(seurat_subset_filtered_UMAP))
+ref <- RunPCA(ref)
+ref <- RunUMAP(ref, dims=1:20)
+DimPlot(ref, label=T, repel=T)
+ps <- AggregateExpression(ref, features = rownames(seurat_subset_filtered_UMAP), normalization.method = "LogNormalize", assays="RNA", return.seurat = T)
+```
+#Transfer labels
+```{r}
+ps <- AggregateExpression(ref, features = rownames(seurat_subset_filtered_UMAP), normalization.method = "LogNormalize", assays="RNA", return.seurat = T)
+ps <- ScaleData(ps, features=rownames(ps))
+pheatmap(LayerData(ps, layer="scale.data"), show_rownames = F)
+```
+```{r}
+anchors <- FindTransferAnchors(reference = ref, 
+                               query = seurat_subset_filtered_UMAP, 
+                               normalization.method = "SCT")
+seurat_subset_filtered_UMAP <- TransferData(anchorset = anchors, 
+                       refdata = ref$CellType, 
+                       prediction.assay = TRUE,
+                       weight.reduction = seurat_subset_filtered_UMAP[["pca"]], 
+                       query = seurat_subset_filtered_UMAP, 
+                       dims=1:30)
+DimPlot(seurat_subset_filtered_UMAP, group.by = "predicted.id")
+```
+
+
+
+
+```{r}
+seurat_subset_filtered_UMAP <- RunUMAP(seurat_subset_filtered, dims = 1:20)
+seurat_subset_filtered_UMAP <- FindNeighbors(seurat_subset_filtered_UMAP, reduction = "pca", dims = 1:20)
+seurat_subset_filtered_UMAP <- FindClusters(seurat_subset_filtered_UMAP, resolution = 0.2)
+#Resolution determines number of clusters: lower if clusters co-localised excessively
+DimPlot(seurat_subset_filtered_UMAP, label=T, repel=T)
+```
+```{r}
+ImageDimPlot(seurat_subset_filtered_UMAP, size=.5)
+```
+```{r}
+markers <- FindMarkers(seurat_subset_filtered_UMAP, ident.1="0", max.cells.per.ident=500)
+head(markers)
+```
+```{r}
+FeaturePlot(seurat_subset_filtered_UMAP, "CD3E", label=T, repel=T)+ scale_color_viridis_c(direction=-1)
+```
+```{r}
+markers <- FindAllMarkers(seurat_subset_filtered_UMAP, max.cells.per.ident = 500)
+top <- Extract_Top_Markers(markers, num_genes = 5, named_vector = FALSE, make_unique = TRUE)
+top
+```
+
+```{r fig.height=9, fig.width=9}
+Clustered_DotPlot(seurat_subset_filtered_UMAP, features = top, group.by = "predicted.id", order_by() k=9)
+?order_by
+```
+
+```{r}
+ImageDimPlot(seurat_subset_filtered_UMAP, fov="ROI", boundaries="segmentation", border.color = "black" )
+```
+
+
+```{r}
+ImageDimPlot(seurat_subset_filtered_UMAP, group.by = "predicted.id")
+cell_colours <- c("#F8766D", "#DB8E00", "#AEA200", "#64B200", "#00BD5C", "#00C1A7", 
+                  "#00BADE", "#00A6FF", "#B385FF", "#EF67EB", "#FF63B6")
+names(cell_colours)  <- c("Epithelium", "Fibroblasts", "T-Cells",  "Myofibroblasts", "Macrophages", 
+                          "Glia", "Endothelium", "Telocytes", "Plasma", "B-Cells", "Pericytes")
+cell_colours
+```
+
+```{r}
+FeaturePlot(seurat_subset_filtered_UMAP, "predicted.id.score")
+```
+```{r}
+FeatureScatter(seurat_subset_filtered_UMAP, "MS4A1", "FOXM1", jitter=T)
+```
+
+
+
+
+```{r}
+ImageFeaturePlot(seurat_subset_filtered_UMAP, "SMOC2") + scale_fill_viridis_c()
+```
+
+```{r}
+markers <- FindAllMarkers(seurat_subset_filtered_UMAP, group.by="predicted.id")
+```
+
+
+# explore the object 
+
+
+# Explore QC Metrics 
+
+
+# Filter poor quality cells 
+
+
+# Cluster the data 
+
+# Transfer the labels onto Xenium from sc RNA reference dataset - what works well and what does not 
+
+# how much of it is limitations of the panel 
+

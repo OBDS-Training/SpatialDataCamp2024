@@ -1,0 +1,107 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r setup}
+library(Seurat)
+library(ggplot2)
+library(scCustomize)
+library(readr)
+library(pheatmap)
+library(matrixStats)
+library(spdep)
+library(geojsonR)
+library(SingleCellExperiment)
+library(scuttle)
+```
+
+```{r}
+seurat_small <- readRDS("/project/shared/spatial_data_camp/HACKATHON/vibe_crew/04_xenium_small_after_QC_filtering_norm_PCA.RDS")
+```
+
+
+https://satijalab.org/seurat/reference/buildnicheassay
+```{r}
+for(n in 4:10){
+  print(n)
+  DefaultAssay(seurat_small) <- "SCT"
+  seurat_small <- BuildNicheAssay(seurat_small,
+                                fov = "LN",
+                                group.by = "Celltype",
+                                assay = paste0("NICHES", n),
+                                cluster.name = paste0("niches_", n),
+                                neighbors.k = 100, #This determines the sparsity of the matrix
+                                niches.k = n)
+}
+```
+
+```{r}
+p <- ImageDimPlot(seurat_small, group.by = paste0("niches_",4:10), fov = "LN")
+p
+
+ggsave("/project/shared/spatial_data_camp/HACKATHON/vibe_crew/Figures/Niches/images_niches.png", p, units = "in", width = 12, height = 12)
+```
+
+```{r}
+seurat_small$niche_1_cells <- ifelse(seurat_small$niches_4 == 1, yes = seurat_small$Celltype, no = "Background")
+
+ p <- ImageDimPlot(seurat_small, group.by = "niche_1_cells", fov = "LN") + 
+   scale_fill_manual(values = c('Hematopoietic Stem Cell' = '#82A0BC',
+                    'Mast Cell' = '#FB7A13',
+                    'Neutrophil' = '#06D6A0',
+                    "Non Classical Monocyte" = '#00A8E8',
+                    'Intermediate Monocyte' = '#007EA7',
+                    'Classical Monocyte' = '#003459',
+                    "Macrophage" = '#5A189A',
+                    'Erythrocyte' = '#C1121F',
+                    'Plasma Cell' = '#C1B793',
+                    'T Cell' = '#7D676D',
+                    "CD4+ αβ Memory T Cell" = '#D5BDAF',
+                    "Effector CD8+ αβ T Cell" = '#A9927D',
+                    "Regulatory T Cell" = '#E0AFA0',
+                    "Effector CD4+ αβ T Cell" = '#C0C0C0',
+                    "Naive Thymus Derived CD4+ αβ T Cell" = '#EFCFE3',
+                    "CD8+ αβ Memory T Cell" = '#9381FF',
+                    "Stromal Cell" = '#FCA311',
+                    'Mature Conventional Dendritic Cell' = '#99582A',
+                    'CD1c+ Myeloid Dendritic Cell' = '#432818',
+                    'CD141+ Myeloid Dendritic Cell' = '#BB9457',
+                    'Mature NK T Cell' = '#A4C3B2',
+                    'Type I NK T Cell' = '#6B9080',
+                    'Plasmacytoid Dendritic Cell' = '#61B4EC',
+                    'B Cell' = '#B4D5A1',
+                    "Naive B Cell" = '#90BE6D',
+                    "Memory B Cell" = '#A7C957',
+                    "Innate Lymphoid Cell" = '#FF8FAB',
+                    "Endothelial Cell" = '#540B0E', "Background" = 'black'))
+ 
+ ggsave("/project/shared/spatial_data_camp/HACKATHON/vibe_crew/Figures/Niches/cell_types_niches.png", p, height = 8, width = 12, units = "in")
+```
+
+
+
+```{r}
+saveRDS(seurat_small, "/project/shared/spatial_data_camp/HACKATHON/vibe_crew/05_xenium_small_with_niches.RDS")
+```
+
+```{r}
+comp <- table(seurat_small$niches_4, seurat_small$Celltype)
+pheatmap(comp, scale="row")
+```
+
+
+```{r}
+unique(seurat_small$Celltype)
+
+df <- seurat_small[[]]
+df <- subset(df, Celltype %in% c("CD4+ αβ Memory T Cell", "CD8+ αβ Memory T Cell", "Memory B Cell"))
+
+p <- ggplot(df, aes(x = Celltype, fill = Celltype)) +
+  geom_bar() +
+  facet_wrap(~niches_4, nrow = 1) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave("/project/shared/spatial_data_camp/HACKATHON/vibe_crew/Figures/Niches/cell_count_niches.png", p, units = "in", width = 10, height = 4)
+```
+

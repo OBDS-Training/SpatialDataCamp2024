@@ -1,0 +1,112 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+Load/install required libraries. Here, we will use SpatialPCA, a dimension reduction method that uses spatial correlation information to extract low-dimensional representations of ST data, facilitating effective clustering and visualization of spatial domains.
+
+We will also try Banksy. It uses a spatial feature augmentation strategy to improve clustering performance by embedding cells in a space that considers both their own and their local neighborhood transcriptomes.
+
+A few alternative methods implemented in R to consider:
+
+BayesSpace: A statistical model that performs spatial clustering using a t-distributed error model and Markov chain Monte Carlo (MCMC) for parameter estimation. It is designed to identify clusters at the spot level, focusing on high-resolution clustering within tissue sections. https://www.bioconductor.org/packages/release/bioc/html/BayesSpace.html
+
+BASS (Bayesian Analysis for Spatial Transcriptomics): This method simultaneously detects spatial domains and clusters cell types within tissue sections using a hierarchical Bayesian model. It is particularly effective for multi-slice clustering, providing robust performance in identifying spatial domains. https://github.com/zhengli09/BASS
+
+Install packages if missing:
+```{r}
+remotes::install_github("prabhakarlab/Banksy")
+remotes::install_github("shangll123/SpatialPCA")
+
+```
+
+
+```{r}
+library(SpatialPCA)
+library(Seurat)
+library(Banksy)
+library(SeuratWrappers)
+```
+
+Lets read in some data - we will use a mouse intestine visium Seurat object from earlier:
+```{r}
+seurat <- readRDS("/project/shared/spatial_data_camp/notebooks_and_code/EXTRA/R_spatial_clustering/seurat.RDS")
+```
+
+Let's quickly visualise the clustering solution we had identified via Seurat:
+```{r}
+SpatialDimPlot(seurat, group.by = "seurat_clusters")
+
+```
+To calculate spatial PCA, we first need to construct a spatial PCA object. 
+
+counts=GetAssayData(seurat, assay="Spatial", layer="counts"):
+
+This extracts the count data from a Seurat object (seurat).
+GetAssayData() is used to access the data within a specific assay in Seurat (in this case, "Spatial"), and layer="counts" specifies that the raw count data should be retrieved. This data serves as the input for creating the spatial PCA object.
+
+
+location=as.matrix(GetTissueCoordinates(seurat)[, 1:2]):
+
+This specifies the spatial coordinates of each spot or cell in the tissue.
+GetTissueCoordinates(seurat) retrieves the tissue coordinates from the Seurat object, and [, 1:2] selects the first two columns,representing the x and y coordinates in the tissue. as.matrix() converts these coordinates into a matrix format, which is required by the CreateSpatialPCAObject function.
+
+
+```{r}
+ST <- CreateSpatialPCAObject(counts=GetAssayData(seurat, assay="Spatial", layer="counts"),
+                            location=as.matrix(GetTissueCoordinates(seurat)[, 1:2]),
+                            project = "SpatialPCA",
+                            gene.type="spatial",
+                            customGenelist=NULL,
+                            min.loctions = 20,
+                            min.features=20)
+```
+
+
+```{r}
+ST <- SpatialPCA_buildKernel(ST)
+
+ST <- SpatialPCA_EstimateLoading(ST,
+                                 fast=TRUE,
+                                 SpatialPCnum=50)
+
+ST <- SpatialPCA_SpatialPCs(ST, 
+                            fast=TRUE)
+```
+
+```{r}
+seurat[["spatialpca"]] <- CreateDimReducObject(embeddings=t(ST@SpatialPCs), 
+                                               key = "spatialpca",
+                                               assay="Spatial")
+```
+
+```{r}
+seurat <- FindNeighbors(seurat, reduction = "spatialpca", dims = 1:20)
+seurat <- FindClusters(seurat, resolution = .7, cluster.name = "spatialpca_clusters")
+```
+
+```{r}
+SpatialDimPlot(seurat, group.by = "spatialpca_clusters")
+```
+
+Next, we can try calculating clusters using Banksy
+```{r}
+seurat <- RunBanksy(seurat,
+                    lambda = 0.2,
+                    verbose=TRUE, 
+                    assay = 'Spatial',
+                    slot = 'data',
+                    features = 'variable',
+                    k_geom = 15)
+
+seurat <- RunPCA(seurat, assay = 'BANKSY', features = rownames(seurat))
+seurat <- RunUMAP(seurat, dims = 1:20)
+seurat <- FindNeighbors(seurat, dims = 1:20)
+seurat <- FindClusters(seurat, resolution = 0.7, cluster.name="banksy_clusters")
+```
+
+```{r}
+SpatialDimPlot(seurat, group.by = "banksy_clusters")
+```

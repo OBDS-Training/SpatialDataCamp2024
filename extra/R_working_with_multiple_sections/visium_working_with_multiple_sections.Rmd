@@ -1,0 +1,232 @@
+---
+title: "Working With Multiple Slides"
+output: html_notebook
+---
+
+
+The below notebook demonstrates how to work with multiple samples, slides or tissue sections. We are using Visium as an example, but the same procedure applies to in situ datasets as well. 
+
+Load the required libraries
+
+```{r}
+library(Seurat)
+library(ggplot2)
+```
+
+```{r}
+data_dir <- "/project/shared/spatial_data_camp/notebooks_and_code/EXTRA/R_working_with_multiple_sections/"
+```
+
+
+Load the data - these sections have been pre-processed using the same workflow as in Day 2 Visium notebook. Section1 is the section we stepped through previously. 
+```{r}
+section1 <- readRDS(file.path(data_dir, "section1.RDS"))
+section2 <- readRDS(file.path(data_dir, "section2.RDS"))
+section3 <- readRDS(file.path(data_dir, "section3.RDS"))
+section4 <- readRDS(file.path(data_dir, "section4.RDS"))
+```
+
+
+Visualise the data from individual sections:
+```{r}
+p1 <- SpatialDimPlot(section1, group.by = "seurat_clusters")
+p2 <- SpatialDimPlot(section2, group.by = "seurat_clusters")
+p3 <- SpatialDimPlot(section3, group.by = "seurat_clusters")
+p4 <- SpatialDimPlot(section4, group.by = "seurat_clusters")
+
+p1 + p2 + p3 + p4
+```
+
+The merge function in Seurat is used to combine multiple Seurat objects into a single object. This is particularly useful when you have data from different sections, conditions, or batches that you want to analyze together. In this case, the code merges four Seurat objects (e.g., from different tissue sections) into one combined Seurat object.
+
+TIP - basic meta data has been added to individual section seurat objects already. To keep the meta data tidy, ensure the meta data columns across all objects to be merged are the same. 
+
+```{r}
+merged <- merge(section1, list(section2, section3, section4))
+```
+Inspect the seurat object - there are now 4 different spatial fields of view present, one for each slide.
+
+TIP: FOVs/slides with repeating names will get automatically renamed by seurat during the merge. It's best practice to give unique, informative names to each section. 
+```{r}
+merged
+```
+Now we can use the merge object to visualise data from any of the sections/FOVs present in the data by specifying images arguement. If this arguement is not specified, SpatialDimPlot will plot all FOVs by default - this can get visually crowded quickly!
+
+merged: The merged Seurat object that contains the spatial data and clustering information.
+group.by = "seurat_clusters": Specifies that the plot should color cells based on their cluster identities.
+images = "mouse_intestine_section4": Specifies that only the spatial data from "mouse_intestine_section4" should be plotted.
+
+```{r}
+SpatialDimPlot(merged, group.by = "seurat_clusters", images = "mouse_intestine_section4")
+```
+
+Inspect the meta data of the merged object. All the columns are present as in individual objects. 
+
+Here, we added SLIDE_ID variable to represent individual sections as well as CONDITION variable which tells us what the tissue sections are.
+```{r}
+head(merged[[]])
+```
+
+To properly integrate the data and obtain a joint embedding and clustering solution, we first need to split the data layers by the variable that we want to integrate. Here, we are using SLIDE_ID. In other use cases, you may have multiple tissue sections on one slide - as long as you have a variable which differentiates which cell or spot is which samples, you can use that to integrate the data instead. 
+
+Here, we will split the SPOTCLEAN assay where our corrected data is - you can also use raw data stored in Spatial assay. 
+
+merged[["SPOTCLEAN"]]: Accesses the SPOTCLEAN assay within the merged Seurat object. 
+
+split(..., f = merged$SLIDE_ID): Splits the SPOTCLEAN assay data based on the SLIDE_ID metadata, effectively creating separate data for each slide.
+
+f = merged$SLIDE_ID: Specifies that the data should be split according to the SLIDE_ID field in the metadata. Each unique SLIDE_ID value corresponds to a different slide or section in the dataset.
+
+Assigning the Split Data:
+
+The result of the split operation is assigned back to the SPOTCLEAN assay in the merged Seurat object. This allows you to maintain separate SPOTCLEAN data for each slide within the same Seurat object.
+
+```{r}
+merged[["SPOTCLEAN"]] <- split(merged[["SPOTCLEAN"]], f = merged$SLIDE_ID)
+```
+Inspect the seurat object - we can now see that the active assay has multiple layers present for each section.
+```{r}
+DefaultAssay(merged) <- "SPOTCLEAN"
+merged
+```
+Now, we will normalise each layer and run PCA as before. 
+
+TIP: Specify spatially variable features here if you want to integrate on spatially variable genes as this can improve the clustering. 
+```{r}
+merged <- SCTransform(merged, assay = "SPOTCLEAN")
+merged <- RunPCA(merged)
+```
+
+Next, we will integrate the split layers by effectively batch correcting the data between different slides.
+
+Harmony is an algorithm designed for integrating single-cell data from different batches or conditions while preserving biological variability. It is particularly effective in handling batch effects and other sources of technical variation.
+
+IntegrateLayers Function:
+Purpose: Integrates multiple layers (e.g., data from different slides or batches) within a Seurat object using a specified method.
+Arguments:
+merged: The Seurat object containing the data to be integrated.
+method = HarmonyIntegration: Specifies that Harmony will be used as the integration method.
+orig = "pca": Indicates that the PCA reduction is the starting point for the integration.
+new.reduction = "harmony": Specifies that the results of the Harmony integration should be stored as a new dimensionality reduction named "harmony".
+normalization.method = "SCT": Specifies that SCTransform-normalized data should be used for the integration
+
+
+Alternative methods implemented in Seurat are: 
+
+RPCAIntegration: Uses Reciprocal PCA (RPCA) to integrate datasets by aligning their principal components. This method is fast and works well for datasets with moderate differences.
+
+CCAIntegration: Canonical Correlation Analysis (CCA) finds shared correlations between datasets. It's one of the original methods for single-cell integration but can be slower on large datasets.
+
+FastMNNIntegration: Fast Mutual Nearest Neighbors (FastMNN) is a method that identifies mutual nearest neighbors across batches and aligns them. 
+
+scVIIntegration: Single-cell Variational Inference (scVI) uses deep generative models to integrate datasets. It is particularly powerful for integrating large and complex datasets but requires more computational resources and a python installation.
+
+
+
+```{r}
+merged <- IntegrateLayers(
+          merged,
+          method = HarmonyIntegration,
+          orig = "pca",
+          new.reduction = "harmony",
+          normalization.method = "SCT"
+          )
+```
+
+Next, the Harmony-integrated data is used to perform clustering and visualize the results using UMAP. This involves finding nearest neighbors based on the Harmony integration, clustering the cells, and then projecting the data into a lower-dimensional UMAP space. We do this exactly as clustering on individual slides, except we explicitly specify to use "harmony" as dimensionality reduction. 
+
+FindNeighbors: Identifies the nearest neighbors of cells based on their positions in the Harmony-integrated space.
+Arguments:
+reduction = "harmony": Specifies that the Harmony-integrated data should be used for finding neighbors.
+dims = 1:20: Uses the first 20 dimensions of the Harmony reduction for neighbor finding.
+
+FindClusters: Performs clustering on the cells based on the neighbor graph generated in the previous step.
+Arguments:
+resolution = 0.5: Controls the granularity of the clustering. A lower resolution results in fewer, larger clusters, while a higher resolution results in more, smaller clusters.
+cluster.name = "integrated_clusters": Specifies that the resulting clusters should be stored with the name "integrated_clusters".
+
+RunUMAP: Projects the cells into a lower-dimensional UMAP space based on the Harmony-integrated data.
+Arguments:
+reduction = "harmony": Specifies that the Harmony-integrated data should be used for UMAP projection.
+dims = 1:20: Uses the first 20 dimensions of the Harmony reduction for UMAP.
+return.model = T: Returns the UMAP model, which can be useful for projecting new data into the same space.
+verbose = F: Suppresses detailed output messages.
+reduction.name = "integrated.umap": Stores the UMAP results under the name "integrated.umap".
+
+
+```{r}
+merged <- FindNeighbors(merged, reduction = "harmony", dims = 1:20)
+merged <- FindClusters(merged, resolution = .5, cluster.name = "integrated_clusters")
+merged <- RunUMAP(
+          merged,
+          reduction = "harmony",
+          dims = 1:20,
+          return.model = T,
+          verbose = F,
+          reduction.name = "integrated.umap"
+        )
+```
+For comparison, we can cluster and embed the unintegrated data by clustering using uncorrected PCA:
+
+```{r}
+merged <- FindNeighbors(merged, reduction = "pca", dims = 1:20)
+merged <- FindClusters(merged, resolution = .5, cluster.name = "unintegrated_clusters")
+merged <- RunUMAP(
+          merged,
+          reduction = "pca",
+          dims = 1:20,
+          return.model = T,
+          verbose = F,
+          reduction.name = "umap"
+        )
+```
+Next, let's visualise the integrated data using UMAP projection from the Harmony-integrated data, showing two different aspects: the integrated clusters and the distribution of cells by SLIDE_ID. By combining these plots, you can assess how well the clusters align with the original slides and identify any potential batch effects or other artifacts.
+
+We can see that most clusters are represented by multiple slides, suggesting that our integration has worked well. 
+
+
+```{r}
+p1 <- DimPlot(merged,  group.by="integrated_clusters", reduction="integrated.umap", label=T, repel=T)
+p2 <- DimPlot(merged, group.by = "SLIDE_ID", reduction = "integrated.umap", shuffle=T)
+p1 + p2
+```
+If we visualise the un-integrated data, we can see that there is a small batch effect that's most evident from SECTION1 spots. However, in this case, this could potentially be due to biological differences - this is the only biological sample taken at DAY 0 of the experiment, while the tissue sections from other mice are from DAY 14. 
+
+When performing data intergration and batch correction, it is important to understand the structure of the experiment to make sure we don't correct real biological differences. 
+```{r}
+p1 <- DimPlot(merged,  group.by="unintegrated_clusters", reduction="umap", label=T, repel=T)
+p2 <- DimPlot(merged, group.by = "SLIDE_ID", reduction = "umap", shuffle=T)
+p1 + p2
+```
+Finally, we can spatially visualise the integrated and unintegrated clusters:
+```{r}
+p1 <- SpatialDimPlot(merged, group.by="unintegrated_clusters", images = "mouse_intestine_section1")
+p2 <- SpatialDimPlot(merged, group.by="unintegrated_clusters", images = "mouse_intestine_section2")
+p3 <- SpatialDimPlot(merged, group.by="unintegrated_clusters", images = "mouse_intestine_section3")
+p4 <- SpatialDimPlot(merged, group.by="unintegrated_clusters", images = "mouse_intestine_section4")
+
+p1+ p2 + p3 + p4
+```
+```{r}
+p1 <- SpatialDimPlot(merged, group.by="integrated_clusters", images = "mouse_intestine_section1")
+p2 <- SpatialDimPlot(merged, group.by="integrated_clusters", images = "mouse_intestine_section2")
+p3 <- SpatialDimPlot(merged, group.by="integrated_clusters", images = "mouse_intestine_section3")
+p4 <- SpatialDimPlot(merged, group.by="integrated_clusters", images = "mouse_intestine_section4")
+
+p1+ p2 + p3 + p4
+```
+
+To join the split layers back (e.g. for downstream analysis), use the JoinLayers function:
+```{r}
+merged <- JoinLayers(merged, assay = "SPOTCLEAN")
+```
+
+Save the integrated object:
+```{r}
+saveRDS(merged, file="visium_integrated.RDS")
+```
+
+```{r}
+sessionInfo()
+```
+

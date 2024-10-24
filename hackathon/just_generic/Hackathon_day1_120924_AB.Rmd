@@ -1,0 +1,165 @@
+---
+title: "Untitled"
+output: html_document
+date: "2024-09-12"
+---
+
+```{r}
+library(Seurat)
+library(ggplot2)
+library(scCustomize)
+library(readr)
+library(pheatmap)
+library(matrixStats)
+library(spdep)
+library(geojsonR)
+```
+
+```{r}
+data_dir <- "/project/shared/spatial_data_camp/datasets/DATASET3/XENIUM_5K_LYMPH_NODE"
+```
+
+ReadXenium <- function (data.dir, outs = c("matrix", "microns"), type = "centroids", 
+          mols.qv.threshold = 20) 
+{
+  type <- match.arg(arg = type, choices = c("centroids", "segmentations"), 
+                    several.ok = TRUE)
+  outs <- match.arg(arg = outs, choices = c("matrix", "microns"), 
+                    several.ok = TRUE)
+  outs <- c(outs, type)
+  has_dt <- requireNamespace("data.table", quietly = TRUE) && 
+    requireNamespace("R.utils", quietly = TRUE)
+  data <- sapply(outs, function(otype) {
+    switch(EXPR = otype, matrix = {
+      matrix <- suppressWarnings(Read10X(data.dir = file.path(data.dir, 
+                                                              "cell_feature_matrix/")))
+      matrix
+    }, centroids = {
+      if (has_dt) {
+        cell_info <- as.data.frame(data.table::fread(file.path(data.dir, 
+                                                               "cells.csv.gz")))
+      } else {
+        cell_info <- read.csv(file.path(data.dir, "cells.csv.gz"))
+      }
+      cell_centroid_df <- data.frame(x = cell_info$x_centroid, 
+                                     y = cell_info$y_centroid, cell = cell_info$cell_id, 
+                                     stringsAsFactors = FALSE)
+      cell_centroid_df
+    }, segmentations = {
+      if (has_dt) {
+        cell_boundaries_df <- as.data.frame(data.table::fread(file.path(data.dir, 
+                                                                        "cell_boundaries.csv.gz")))
+      } else {
+        cell_boundaries_df <- read.csv(file.path(data.dir, 
+                                                 "cell_boundaries.csv.gz"), stringsAsFactors = FALSE)
+      }
+      names(cell_boundaries_df) <- c("cell", "x", "y")
+      cell_boundaries_df
+    }, microns = {
+      
+      transcripts <- arrow::read_parquet(file.path(data.dir, "transcripts.parquet"))
+      transcripts <- subset(transcripts, qv >= mols.qv.threshold)
+      
+      df <- data.frame(x = transcripts$x_location, y = transcripts$y_location, 
+                       gene = transcripts$feature_name, stringsAsFactors = FALSE)
+      df
+    }, stop("Unknown Xenium input type: ", otype))
+  }, USE.NAMES = TRUE)
+  return(data)
+}
+
+```{r create-object}
+data <- ReadXenium(data_dir, outs = "matrix", type=c("centroids", "segmentations"))
+data
+
+cell_meta_data <- read.csv(file.path(data_dir, "cells.csv.gz")) 
+rownames(cell_meta_data) <- cell_meta_data$cell_id
+head(cell_meta_data)
+
+seurat <- CreateSeuratObject(counts = data$matrix[["Gene Expression"]],
+                                 assay = "XENIUM",
+                                 meta.data = cell_meta_data)
+coords <- CreateFOV(coords = list(centroids = CreateCentroids(data$centroids), 
+                                  segmentation = CreateSegmentation(data$segmentations)),
+                    type = c("segmentation", "centroids"),
+                    assay = "XENIUM")
+seurat[["LYMPH"]] <- coords
+
+names(data$matrix)
+
+seurat[["Negative.Control.Codeword"]] <- CreateAssayObject(counts = data$matrix[["Negative Control Codeword"]])
+seurat[["Negative.Control.Probe"]] <- CreateAssayObject(counts = data$matrix[["Negative Control Probe"]])
+seurat[["Unassigned.Codeword"]] <- CreateAssayObject(counts = data$matrix[["Unassigned Codeword"]])
+
+```
+```{r qc}
+ImageFeaturePlot(seurat, "nCount_XENIUM") + scale_fill_viridis_c()
+ImageFeaturePlot(seurat, "nFeature_XENIUM") + scale_fill_viridis_c()
+seurat$cell_nucleus_ratio <- seurat$nucleus_area / seurat$cell_area
+head(seurat$cell_nucleus_ratio)
+seurat[[]]
+ImageFeaturePlot(seurat, features = "cell_nucleus_ratio") + scale_fill_viridis_c()
+seurat[["large_cells"]] <- seurat$cell_area < quantile(seurat$cell_area, 0.99)
+seurat[["small_cells"]] <- seurat$cell_area > quantile(seurat$cell_area, 0.01)
+
+ggplot(seurat[[]], aes(cell_area)) + geom_density()
+ggplot(seurat[[]], aes(nCount_XENIUM, cell_area))+geom_point(size=0.2)
+
+ImageDimPlot(seurat, group.by = "large_cells")
+
+library(tidyverse)
+seurat[[]]%>%mutate(median_ncounts=median(nCount_XENIUM)+2*stats::mad(nCount_XENIUM))%>%ggplot(aes(x=orig.ident,y=nCount_XENIUM))+geom_violin()+geom_hline(aes(yintercept=median_ncounts))
+
+p1 <- VlnPlot(seurat, "nFeature_XENIUM", group.by = "small_cells", pt.size = .1, alpha = .5) + labs(title="Small Cell Filter")
+p2 <- VlnPlot(seurat, "nFeature_XENIUM", group.by = "large_cells", pt.size = .1, alpha = .5)+ labs(title="Large Cell Filter")
+
+p1+p2
+p1
+
+ggplot(seurat[[]], aes(cell_nucleus_ratio))+geom_density()
+
+
+qc <- c("nCount_XENIUM", "nFeature_XENIUM")
+names(qc) <- qc
+lapply(qc, function(u){
+  seurat[[]]%>%mutate(median_counts=median(.data[[u]]))%>%ggplot(aes(x=orig.ident, y=.data[[u]],fill=orig.ident))+geom_violin()+geom_hline(aes(yintercept = median_counts))
+})
+
+
+seurat[[]]%>%mutate(median_counts=median(nCount_XENIUM))%>%ggplot(aes(x=orig.ident, y=nCount_XENIUM))+geom_violin()+geom_hline(aes(yintercept = median_counts))
+
+mean(median(seurat$nCount_XENIUM)-2*stats::mad(seurat$nCount_XENIUM))
+
+seurat[["filter"]] <- seurat$nCount_XENIUM>=20
+ImageDimPlot(object = seurat, group.by = "filter")
+
+ImageFeaturePlot(seurat, "nCount_Negative.Control.Codeword") + scale_fill_viridis_c()
+ImageFeaturePlot(seurat, "nCount_Negative.Control.Probe") + scale_fill_viridis_c()
+ImageFeaturePlot(seurat, "nCount_Unassigned.Codeword") + scale_fill_viridis_c()
+
+seurat$PROBE_FILTER <- seurat$nCount_Unassigned.Codeword == 0 &
+                       seurat$nCount_Negative.Control.Codeword == 0 &
+                       seurat$nCount_Negative.Control.Probe == 0
+
+ImageDimPlot(object = seurat, group.by = "PROBE_FILTER")
+
+seurat_ss <- subset(seurat, PROBE_FILTER & large_cells & small_cells & filter)
+saveRDS(object = seurat_ss,"/project/shared/spatial_data_camp/HACKATHON/just_generic/objects/subset_postqc.rds")
+
+seurat_ss
+```
+
+
+```{r normalise}
+seurat_ss <- readRDS("/project/shared/spatial_data_camp/HACKATHON/just_generic/objects/subset_postqc.rds")
+seurat_ss <- SCTransform(seurat_ss, assay = "XENIUM", clip.range = c(-10, 10))
+
+seurat_ss <- RunPCA(seurat_ss)
+
+
+
+
+
+
+```
+

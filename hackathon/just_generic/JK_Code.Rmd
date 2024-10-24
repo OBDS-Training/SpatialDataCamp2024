@@ -1,0 +1,259 @@
+---
+title: "Day4_Hack"
+output: html_document
+date: "2024-09-12"
+---
+
+```{r}
+library(Seurat)
+library(ggplot2)
+library(scCustomize)
+library(readr)
+library(pheatmap)
+library(matrixStats)
+library(spdep)
+library(geojsonR)
+```
+
+```{r}
+data_dir <- "/project/shared/spatial_data_camp/datasets/DATASET3/XENIUM_5K_LYMPH_NODE"
+data <- ReadXenium(data_dir, outs = "matrix", type=c("centroids", "segmentations"))
+
+cell_meta_data <- read.csv(file.path(data_dir, "cells.csv.gz"))
+rownames(cell_meta_data) <- cell_meta_data$cell_id
+head(cell_meta_data)
+```
+
+
+```{r}
+seurat <- CreateSeuratObject(counts = data$matrix[["Gene Expression"]],
+                                 assay = "XENIUM",
+                                 meta.data = cell_meta_data)
+seurat
+```
+```{r}
+coords <- CreateFOV(coords = list(centroids = CreateCentroids(data$centroids), 
+                                  segmentation = CreateSegmentation(data$segmentations)),
+                    type = c("segmentation", "centroids"),
+                    assay = "XENIUM")
+seurat[["LYMPH"]] <- coords  
+
+```
+**Unassigned codewords** are unused codewords. There is no probe in a particular gene panel that will generate the codeword. This is a com
+
+**Negative control probes** are probes that exist in the panels but target non-biological sequences. They can be used to assess the specificity of the assay.
+
+**Negative control codewords** are codewords in the codebook that do not have any probes matching that code. They are chosen to meet the same requirements as regular codewords and can be used to assess the specificity of the decoding algorithm.
+
+
+
+```{r}
+seurat[["Negative.Control.Codeword"]] <- CreateAssayObject(counts = data$matrix[["Negative Control Codeword"]])
+seurat[["Negative.Control.Probe"]] <- CreateAssayObject(counts = data$matrix[["Negative Control Probe"]])
+seurat[["Unassigned.Codeword"]] <- CreateAssayObject(counts = data$matrix[["Unassigned Codeword"]])
+```
+```{r}
+seurat
+
+#Filtering QC Object 
+ImageFeaturePlot(seurat, "nCount_XENIUM") + scale_fill_viridis_c()
+ImageFeaturePlot(seurat, "nFeature_XENIUM") + scale_fill_viridis_c()
+ImageFeaturePlot(seurat, "cell_area") + scale_fill_viridis_c()
+
+ggplot(seurat[[]], aes(nFeature_XENIUM)) + geom_density()
+quantile(seurat$nFeature_XENIUM, c(0.01, 0.1, 0.5, 0.9, 0.99))
+seurat$cell_nucleus_ratio <- seurat$nucleus_area / seurat$cell_area
+ImageFeaturePlot(seurat, "cell_nucleus_ratio") + scale_fill_viridis_c()
+
+ggplot(seurat[[]], aes(cell_area)) + geom_density()
+ggplot(seurat[[]], aes(nCount_XENIUM, cell_area)) + geom_point()
+
+```
+```{r}
+#We can further check that this is likely the case by plotting the ratio between nuclei and total cell area. Decrease in percentage of cell area occupied by nucleus in areas of low cell density.
+
+#The cell-to-nucleus area ratio can also potentially provide insights into cell morphology, cell type and potential changes in cellular states or conditions. For example, T-Cells can often be quite well identified by this variable alone, as they have a small cytoplasm volume.  However, without a cell boundary stain, this metric mainly captures segmentation artefacts, so be careful about over-interpretation!
+
+seurat$cell_nucleus_ratio <- seurat$nucleus_area / seurat$cell_area
+ggplot(seurat[[]], aes(cell_nucleus_ratio))+geom_density()
+
+ImageFeaturePlot(seurat, "cell_nucleus_ratio") + scale_fill_viridis_c()
+
+colnames(seurat[[]])
+```
+
+
+```{r}
+seurat[["SIZE_FILTER_LARGE"]] <- seurat$cell_area < quantile(seurat$cell_area, .99)
+ImageDimPlot(seurat, group.by="SIZE_FILTER_LARGE")
+p1 <- VlnPlot(seurat, "nFeature_XENIUM", group.by = "SIZE_FILTER_LARGE", pt.size = .1, alpha = .5) + labs(title="Large Cell Filter")
+
+seurat[["SIZE_FILTER_SMALL"]] <- seurat$cell_area > quantile(seurat$cell_area, .01)
+ImageDimPlot(seurat, group.by="SIZE_FILTER_SMALL")
+p2 <- VlnPlot(seurat, "nFeature_XENIUM", group.by = "SIZE_FILTER_SMALL", pt.size = .1, alpha = .5)+ labs(title="Small Cell Filter")
+
+p1 + p2
+
+#VlnPlot(seurat, group.by = "nFeature_XENIUM", 
+```
+```{r}
+#
+ggplot(seurat[[]], aes(nCount_XENIUM)) + geom_density()
+mean(median(seurat$nCount_XENIUM)-2*stats::mad(seurat$nCount_XENIUM))
+
+seurat$TRANSCRIPT_FILTER <- seurat$nCount_XENIUM >= 20
+ImageDimPlot(seurat, group.by="TRANSCRIPT_FILTER")
+
+
+ImageFeaturePlot(seurat, "nCount_Negative.Control.Codeword") + scale_fill_viridis_c()
+ImageFeaturePlot(seurat, "nCount_Negative.Control.Probe") + scale_fill_viridis_c()
+ImageFeaturePlot(seurat, "nCount_Unassigned.Codeword") + scale_fill_viridis_c()
+
+seurat$PROBE_FILTER <- seurat$nCount_Unassigned.Codeword == 0 &
+                       seurat$nCount_Negative.Control.Codeword == 0 &
+                       seurat$nCount_Negative.Control.Probe == 0
+ImageDimPlot(seurat, group.by="PROBE_FILTER")
+```
+```{r}
+seurat <- subset(seurat, PROBE_FILTER & SIZE_FILTER_LARGE & SIZE_FILTER_SMALL & TRANSCRIPT_FILTER)
+```
+
+
+```{r}
+seurat <- SCTransform(seurat, assay = "XENIUM", clip.range = c(-10, 10))
+seurat <- RunPCA(seurat)
+seurat <- RunUMAP(seurat, dims = 1:20)
+seurat <- FindNeighbors(seurat, reduction = "pca", dims = 1:20)
+seurat <- FindClusters(seurat, resolution = 0.7)
+DimPlot(seurat, label=T, repel=T)
+ImageDimPlot(seurat, size=.5)
+
+rownames(seurat)
+seurat@meta.data
+```
+
+```{r}
+seurat
+
+All.Markers <- FindAllMarkers(seurat, only.pos = TRUE,assay = "SCT",max.cells.per.ident = 500, slot = "data")
+head(seurat@assays$SCT@scale.data)
+head(All.Markers)
+All.Markers
+
+library(BiocGenerics)
+library(dplyr)
+
+All.Markers <- All.Markers%>%mutate(diff_pct=abs(pct.1-pct.2))
+markers_top10 <- All.Markers%>%group_by(cluster)%>%arrange(desc(diff_pct))%>%slice_min(n=10, order_by = p_val_adj,with_ties = FALSE)
+markers_top20 <- All.Markers%>%group_by(cluster)%>%arrange(desc(diff_pct))%>%slice_min(n=20, order_by = p_val_adj,with_ties = FALSE)
+markers_top30 <- All.Markers%>%group_by(cluster)%>%arrange(desc(diff_pct))%>%slice_min(n=30, order_by = p_val_adj,with_ties = FALSE)
+
+markers <- list(All.Markers=All.Markers, markers_top10=markers_top10, markers_top20=markers_top20, markers_top30=markers_top30)
+markers
+
+
+```
+
+
+```{r fig.height=12, fig.width=7}
+top <- Extract_Top_Markers(All.Markers, num_genes = 5, named_vector = FALSE, make_unique = TRUE)
+top
+Clustered_DotPlot(seurat, features = top, k=18)
+```
+
+
+```{r fig.height=12, fig.width=7}
+FeaturePlot(seurat, "CD3E", label=T, repel=T)+ scale_color_viridis_c(direction=-1)
+FeaturePlot(seurat, "MS4A1", label=T, repel=T)+  scale_color_viridis_c(direction=-1)
+FeaturePlot(seurat, "CEACAM5", label=T, repel=T)+ scale_color_viridis_c(direction=-1)
+FeaturePlot(seurat, "KIT", label=T, repel=T)+ scale_color_viridis_c(direction=-1)
+```
+
+
+```{r fig.height=8, fig.width=24}
+DotPlot(seurat, features =c(
+                             "PTPRC","CD27",
+                                    "CD247","CD3E",
+                                    "CD4","IL7R","TRAC","KLRB1","CCR7","CXCL9","CXCL10","LAMP3",
+                                    "CD8A","CCL5","GZMK","GZMA",
+                                    "NKG7","FGFBP2","GNLY", 
+                                    "FOXP3","RTKN2","IL2RA","CTLA4",
+                                    "BANK1","CD79A","MS4A1","COCH","CD19","CXCR4","TCL1A",
+                                    "PRDM1","MZB1","DERL3","FKBP11","TNFRSF17","TNFRSF13B",
+                                    "CD163","MS4A6A","MS4A4A","CD68","MRC1","LILRB2",
+                                    "CD14","VCAN","S100A12","FCN1",
+                                    "FCGR3A","AIF1","CPA3","MS4A2","KIT","SLC18A2",
+                                    "FCER1A","CD1C","CLEC10A","PLD4","LILRA4", "IL3RA","SPIB"), dot.min = 0,
+  dot.scale = 5, col.min = 0, col.max = 3,cols = c("lightgrey", "darkblue"))+
+                theme(axis.title.y = element_text(size=10))+
+                theme(axis.title.x = element_text(size = 10))+
+                theme(axis.text.y = element_text(size = 10))+
+                theme(axis.text.x = element_text(size=10))
+
+
+
+
+```
+```{r}
+#Next Manually Annotate the different clusters: 
+#Based on top markers from each cluster you can annotate the cell clusters. 
+
+old.cluster.ids <- c(0-22)
+new.cluster.ids <- c("0_FoBC","1_TCell","2_Treg_TCell","3_+CD8_TCell","4_+CD4_TCell","5_LEC", "6_ENDO","7_Stromal","8_Stromal","9_PLASMA","10_BCell","11_Stromal","12_MAC","13_Granulo","14_MBC","15_pDC","16_FoBC","17_cDC","18_ILC","19_ENDO","20_MBC", "21_Prolif_BC","22_ENDO") 
+
+seurat$clusterid <- factor(plyr::mapvalues(x = seurat$seurat_clusters, from = seq(0,22,1), to = c("0_FoBC","1_TCell","2_Treg_TCell","3_+CD8_TCell","4_+CD4_TCell","5_LEC", "6_ENDO","7_Stromal","8_Stromal","9_PLASMA","10_BCell","11_Stromal","12_MAC","13_Granulo","14_MBC","15_pDC","16_FoBC","17_cDC","18_ILC","19_ENDO","20_MBC", "21_Prolif_BC","22_ENDO")),levels = c("0_FoBC","1_TCell","2_Treg_TCell","3_+CD8_TCell","4_+CD4_TCell","5_LEC", "6_ENDO","7_Stromal","8_Stromal","9_PLASMA","10_BCell","11_Stromal","12_MAC","13_Granulo","14_MBC","15_pDC","16_FoBC","17_cDC","18_ILC","19_ENDO","20_MBC", "21_Prolif_BC","22_ENDO"))
+       
+seurat@meta.data
+names(x = new.cluster.ids) <- levels(x = seurat)
+seurat <- RenameIdents(seurat, new.cluster.ids)
+DimPlot(seurat, reduction = "umap", label = TRUE, repel = TRUE)
+DimPlot(seurat, reduction = "umap", label = TRUE, repel = TRUE) + NoLegend()
+
+
+#Cell Counts per Cluster and disease state
+seurat@meta.data
+count_table <- table(seurat@meta.data$clusterid)
+count_table
+
+names(x = new.cluster.ids) <- levels(x = seurat)
+seurat <- RenameIdents(seurat, new.cluster.ids)
+
+seurat@meta.data
+md <- seurat@meta.data
+umap <- FetchData(seurat, vars = c("umap_1", "umap_2"))
+md$x <- rownames(md)
+umap$x <- rownames(umap)
+md <- left_join(md, umap, by= "x")
+labels <- md%>%dplyr::group_by(SCT_snn_res.0.7, clusterid)%>%dplyr::select(umap_1, umap_2)%>%summarise_all(median)
+
+cols <- c(RColorBrewer::brewer.pal(name = "Set3",n = 12),RColorBrewer::brewer.pal(name = "Set2",n = 8),RColorBrewer::brewer.pal(name = "Set1",n = 3))
+cols
+
+ggplot(md, mapping=aes(umap_1, umap_2, colour=factor(SCT_snn_res.0.7)))+geom_point(shape=20,size=0.1, show.legend = FALSE)+ggrepel::geom_text_repel(labels, mapping=aes(label=clusterid), colour="black", fontface="bold", size=4, show.legend = FALSE)+theme_bw()+scale_color_manual(values = cols)
+
+cols <- c(RColorBrewer::brewer.pal(name = "Set3",n = 12),RColorBrewer::brewer.pal(name = "Set2",n = 8),RColorBrewer::brewer.pal(name = "Set1",n = 3))
+cols  
+```
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+readRDS(file= "/project/shared/spatial_data_camp/HACKATHON/just_generic/JK_LYMPH_Xenium_UnAnnObj.rds")
+#saveRDS(object = seurat, file = "/project/shared/spatial_data_camp/HACKATHON/just_generic/JK_LYMPH_Xenium_UnAnnObj.rds")
+```
+
+```{r}
+
+```
+
+
+
+

@@ -1,0 +1,336 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is my script to try and analyse data from scratch - DATASET 2 -> MERSCOPE 
+
+```{r}
+library(Seurat)
+library(ggplot2)
+library(scCustomize)
+library(readr)
+library(pheatmap)
+library(matrixStats)
+library(spdep)
+library(geojsonR)
+```
+
+# Read in DAta 
+```{r}
+data_dir <- "/project/shared/spatial_data_camp/datasets/DATASET2/MERSCOPE_COLORECTAL_CANCER/"
+# can use load function from seurat instead
+# data <- ReadVizgen(data_dir)
+
+
+# Don't load segmentation boundariers just load cell x gene matric and centroid = skip the transcripts 
+
+# put type = centoids to prevent reading hdf5 files which takes ages 
+data <- ReadVizgen(data_dir, molecules=NA, type ='centroids')
+
+?LoadVizgen
+cell_metadata = read.csv('/project/shared/spatial_data_camp/datasets/DATASET2/MERSCOPE_COLORECTAL_CANCER/cell_metadata.csv')
+# now add metadata to object 
+#cell_metadata
+cell_metadata
+dim(data$transcripts)
+
+# This is gene expression matrix 
+data$transcripts
+
+# Make the seurat object 
+?CreateSeuratObject
+seurat <- CreateSeuratObject(counts = data$transcripts,
+                                 assay = "MERSCOPE",
+                                 meta.data = cell_metadata)
+
+
+# set the rownames of the cells in the dataobject to the cell ids 
+rownames(data$centroids) <- data$centroids$cell
+
+# Add the image slot to the object - we've left out the segmentation data as it took ages to load 
+# centroids = CreateCentroids(data$centroids[Cells(seurat),] - here we have reordered the cells in the data$centroids to be the # same as the order of cells in the seurat object - if you don't do this you get a wierd tiling image when try to plot a subset
+coords <- CreateFOV(coords = list(centroids = CreateCentroids(data$centroids[Cells(seurat),])),
+                    type = c("centroids"),
+                    assay = "MERSCOPE")
+
+seurat[["COLON"]] <- coords  # adding image has a warning check the image to see what it looks like 
+ImageDimPlot(seurat,fov='COLON')
+
+# Mark the blank probes that are detected in each cell - don't think we have the other codeword categories that are present 
+seurat[["Negative.Control.Codeword"]] <- CreateAssayObject(counts =data$transcripts[grepl('Blank',rownames(data$transcripts)),])
+
+saveRDS(seurat,file='/project/shared/spatial_data_camp/HACKATHON/the_bigger_fish/cg_seurat_obj')
+
+
+```
+
+
+```{r}
+ImageFeaturePlot(seurat, "nCount_MERSCOPE") + scale_fill_viridis_c()
+```
+
+# explore the 
+
+Look at number of genes per cell
+```{r}
+ImageFeaturePlot(seurat, "nFeature_MERSCOPE", axes = TRUE) + scale_fill_viridis_c()
+
+# Sketch based analysis helpss scale to process large tissue 
+# COuld transfer labels from reference now and the plot cell types and them segement to specific areas 
+
+```
+The image is big and takes ages so lets make a subet to get out code correct on and work through 
+
+# Crop function only crops the image not subset the whole thing 
+cropped <- Crop(seurat[["COLON"]], x = c(2000, 5000), y = c(4000, 7000), coords = "plot")
+seurat[["ROI1"]] <- cropped
+```{r}
+# Now lets choose an area y = 4000 - 7000 , x = 2000,5000
+
+# dollar sign always for metadata columns 
+# MErscope gives you local and global co-ordinates - we want the global coordinates 
+# seurat_subset <- seurat[,seurat$center_x > 2000 & seurat$center_x < 5000 & seurat$center_y < 7000 & seurat$center_y > 4000]
+# So we are supposed to use the global coordinates -> these are imn image slot / boundaries / centroids 
+
+# MERSCOPE CELL GETS read in as an integer but the integers are too big - need to read in cell ids as character so use tidyverse to read in set as character
+global_coordinates <- data.frame(seurat@images$COLON$centroids)
+global_coordinates
+
+## This does not work - need to order correctly 
+seurat$global_X <- global_coordinates$x
+seurat$global_Y <- global_coordinates$y
+seurat_subset <- seurat[,seurat$global_X < 5000 & seurat$global_X >2000 & seurat$global_Y < 7000 & seurat$global_Y > 4000]
+ImageDimPlot(seurat_subset, axes=T)
+
+# This was to check the cells that were being plotted and global X & Y were correct - which they were 
+# The following was a lot of trouble shooting to try and work out why we had a wierd image tiling effect. 
+# ggplot(seurat[[]], aes(global_X, global_Y)) + geom_point()
+
+# THIS SETS A FOV FOR A CROPED AREA OF THE IMAGE 
+#cropped <- Crop(seurat[["COLON"]], x = c(2000, 5000), y = c(4000, 7000), coords = "plot")
+#seurat[["ROI1"]] <- cropped
+#ImageDimPlot(seurat, axes=T, fov="ROI1")
+
+# get the cell ids of the cells that are in the cropped image 0 this was trouble shooting to see why we were 
+# only getting little squares 
+#cells_ids <- Cells(seurat@images$ROI1)
+#seurat_subset_cells <- seurat[,cells_ids]
+#ImageDimPlot(seurat_subset_cells, axes=T)
+
+# Check order of the metadata rownames and rownames of the colon - they are not the same!! 
+# rownames(seurat[[]]) == Cells(seurat@images$COLON)
+# For image the order of the cell names does not get maintained for
+
+ 
+?ImageDimPlot
+```
+
+
+```{r}
+ImageFeaturePlot(seurat_subset, "nCount_MERSCOPE") + scale_fill_viridis_c() 
+```
+
+```{r}
+ImageFeaturePlot(seurat_subset, "nFeature_MERSCOPE") + scale_fill_viridis_c() 
+
+```
+
+
+```{r}
+ggplot(seurat_subset[[]], aes(nFeature_MERSCOPE)) + geom_density()
+
+```
+Interesting this is quite different to the Xenium data - there are a large number of cells with few features - maybe we can plot these somehow 
+
+cOuld filter and also chec 
+
+```{r}
+quantile(seurat_subset$nFeature_MERSCOPE, c(0.01, 0.1, 0.5, 0.9, 0.99))
+```
+
+```{r}
+
+# Can use MERSCOPE Volume incase 
+ImageFeaturePlot(seurat_subset, "volume") + scale_fill_viridis_c()
+```
+```{r}
+ggplot(seurat_subset[[]], aes(volume)) + geom_density()
+
+```
+Compared to visium there looks like cells start with a larger volume - some prefiltering of small cells 
+
+```{r}
+ggplot(seurat_subset[[]], aes(nCount_MERSCOPE, volume)) + geom_point() 
+
+```
+Do minimum filter based on what can cluster on - 
+
+```{r}
+seurat_subset[["SIZE_FILTER_LARGE"]] <- seurat_subset$volume < quantile(seurat_subset$volume, .99)
+ImageDimPlot(seurat_subset, group.by="SIZE_FILTER_LARGE")
+
+```
+```{r}
+seurat_subset[["SIZE_FILTER_SMALL"]] <- seurat_subset$volume > quantile(seurat_subset$volume, .01)
+ImageDimPlot(seurat_subset, group.by="SIZE_FILTER_SMALL")
+```
+
+```{r, fig.height=8}
+
+p1 <- VlnPlot(seurat_subset, "nFeature_MERSCOPE", group.by = "SIZE_FILTER_SMALL", pt.size = .1, alpha = .5) + labs(title="Small Cell Filter")
+
+p2 <- VlnPlot(seurat_subset, "nFeature_MERSCOPE", group.by = "SIZE_FILTER_LARGE", pt.size = .1, alpha = .5)+ labs(title="Large Cell Filter")
+
+p1 + p2
+
+```
+```{r}
+seurat_subset[["SIZE_FILTER_SMALL"]] <- seurat_subset$volume > quantile(seurat_subset$volume, .1)
+ImageDimPlot(seurat_subset, group.by="SIZE_FILTER_SMALL")
+
+```
+
+```{r}
+seurat$TRANSCRIPT_FILTER <- seurat$nCount_MERSCOPE >= 15
+ImageDimPlot(seurat, group.by="TRANSCRIPT_FILTER")
+```
+
+Some areas have lots of low transcripts becuase haven't cleared or lots of mucus so large areas discarded 
+
+```{r}
+seurat_subset$TRANSCRIPT_FILTER <- seurat_subset$nCount_MERSCOPE >= 15
+ImageDimPlot(seurat_subset, group.by="TRANSCRIPT_FILTER")
+
+```
+```{r}
+ImageFeaturePlot(seurat_subset, "nCount_Negative.Control.Codeword") + scale_fill_viridis_c()
+
+
+```
+Check the code words and see if its specific ones that are - and check the actual assingment of the negative control genes - can look at control probe versus real gene ratio in each cell and if high proportion from control probes only bin the gene 
+
+For now lets just carry on 
+```{r}
+
+
+
+```
+Might want to adjust this and probe filter - see above either set as level or as blank / real transcript ratio 
+```{r}
+seurat_subset$PROBE_FILTER <- seurat_subset$nCount_Negative.Control.Codeword == 0
+ImageDimPlot(seurat_subset, group.by="PROBE_FILTER")
+```
+
+# Explore QC Metrics 
+
+```{r}
+seurat_filtered <- subset(seurat_subset, PROBE_FILTER & SIZE_FILTER_LARGE & SIZE_FILTER_SMALL & TRANSCRIPT_FILTER)
+ImageDimPlot(seurat_filtered)
+```
+```{r}
+seurat_filtered <- SCTransform(seurat_filtered, assay = "MERSCOPE", clip.range = c(-10, 10))
+seurat_filtered <- RunPCA(seurat_filtered)
+ElbowPlot(seurat_filtered, 50)
+
+
+```
+
+# Filter poor quality cells 
+
+
+# Cluster the data 
+```{r, fig.height=12}
+PC_Plotting(seurat_filtered, dim_number = 1)
+
+```
+```{r}
+FeaturePlot(seurat_filtered, "COL1A1", reduction = "pca") + scale_color_viridis_c()
+
+```
+```{r}
+ImageFeaturePlot(seurat_filtered, "PC_1") + scale_fill_viridis_c()
+
+```
+```{r}
+ImageFeaturePlot(seurat_filtered, "COL1A1", size=.5) + scale_fill_viridis_c()
+
+```
+```{r}
+seurat_filtered <- RunUMAP(seurat_filtered, dims = 1:20)
+seurat_filtered <- FindNeighbors(seurat_filtered, reduction = "pca", dims = 1:20)
+seurat_filtered <- FindClusters(seurat_filtered, resolution = 0.7)
+DimPlot(seurat_filtered, label=T, repel=T)
+
+
+```
+```{r}
+
+ImageDimPlot(seurat_filtered, size=.6)
+
+
+```
+
+# Transfer the labels onto Xenium from sc RNA reference dataset - what works well and what does not 
+```{r}
+markers <- FindMarkers(seurat_filtered, ident.1="0", max.cells.per.ident=500)
+head(markers)
+```
+
+```{r}
+FeaturePlot(seurat_filtered, "CD3E", label=T, repel=T)+ scale_color_viridis_c(direction=-1)
+
+```
+
+
+```{r}
+FeaturePlot(seurat_filtered, "MS4A1", label=T, repel=T)+  scale_color_viridis_c(direction=-1)
+
+```
+
+
+```{r}
+FeaturePlot(seurat_filtered, "KIT", label=T, repel=T)+ scale_color_viridis_c(direction=-1)
+
+```
+
+
+```{r}
+markers <- FindAllMarkers(seurat_filtered, max.cells.per.ident = 500)
+head(markers)
+```
+```{r,fig.height=10,fig.width=6}
+top <- Extract_Top_Markers(markers, num_genes = 5, named_vector = FALSE, make_unique = TRUE)
+top
+Clustered_DotPlot(seurat_filtered, features = top, k=18)
+
+```
+```{r}
+ImageDimPlot(seurat_filtered, cells=WhichCells(seurat_filtered, expression = seurat_clusters %in% c(0, 5)))
+
+```
+
+```{r}
+ImageDimPlot(seurat_filtered, axes = T)
+
+```
+```{r}
+ImageDimPlot(seurat_filtered, fov="ROI1", border.color = "black" )
+
+```
+
+
+# how much of it is limitations of the panel 
+
+```{r}
+ref <- readRDS("/project/shared/spatial_data_camp/datasets/SINGLE_CELL_REFERENCES/COLON_HC_5K_CELLS.RDS")
+DimPlot(ref)
+ref <- SCTransform(ref, residual.features =rownames(seurat))
+ref <- RunPCA(ref)
+ref <- RunUMAP(ref, dims=1:20)
+DimPlot(ref, label=T, repel=T)
+
+```
+```{r}
+
+```

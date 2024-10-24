@@ -1,0 +1,55 @@
+---
+title: "Molecule Swap Correction in Visium Data"
+output: html_notebook
+---
+
+In sequencing-based spatial transcriptomics, like in droplet-based single-cell RNA sequencing, each molecule is barcoded with both a spot or cell barcode and a unique RNA molecule tag. Barcode swapping is a well-known technical issue that can occur during sequencing on Illumina platforms, particularly in the context of multiplexed sequencing. This problem arises when index sequences used to differentiate between different samples or libraries within a sequencing run are misassigned, leading to incorrect assignment of sequencing reads to the wrong samples. This can compromise the integrity of the data and lead to erroneous conclusions.
+
+In visium spatial transcriptomics, this can be more problematic than in scRNA-Seq, because the spot barcode pool is much smaller than all possible cell barcodes in scRNA-Seq, and therefore largely same between different samples. This means that a swapped molecule between samples is much more likely to be included in the downstream analysis. 
+
+The swappedDrops function is a tool in the DropletUtils package that helps address the problem of barcode swapping in droplet-based single-cell RNA sequencing and is equality applicable here. By identifying and correcting swapped droplets, it improves the reliability of the data and ensures that downstream analyses reflect the true biological state of the tissue rather than technical artifacts.
+
+
+*library(DropletUtils)*: Loads the DropletUtils package, which provides tools for analyzing droplet-based single-cell RNA sequencing data. It includes functions for processing raw sequencing data, detecting empty droplets, and extracting counts and also has useful functions for spatial transcriptomics data. Explore documentation here: https://bioconductor.org/packages/release/bioc/html/DropletUtils.html
+
+```{r}
+library(DropletUtils)
+```
+
+Set up paths to Spaceranger molecule information h5 files, which are required for molecule swap correction:
+```{r}
+spacerangers <- "/project/shared/spatial_data_camp/datasets/DATASET1/VISIUM_V1_MOUSE_INTESTINE/spaceranger"
+
+h5s <- c(file.path(spacerangers, "SRR14083626_HEALTHY_DAY0/outs/molecule_info.h5"),
+        file.path(spacerangers, "SRR14083627_DSS_DAY14/outs/molecule_info.h5"),
+        file.path(spacerangers, "SRR17184260_DSS_DAY14_BCELL_DEPLETED/outs/molecule_info.h5"),
+        file.path(spacerangers, "SRR17184261_DSS_DAY14_CONTROL/outs/molecule_info.h5"))
+```
+
+Correct barcode swapping by running swappedDrops.
+
+The function returns:
+
+1. A list of matrices (one for each sample) with swapped molecule counts corrected
+2. A list of matrices (one for each sample) with counts of removed molecules
+3. A table with read counts for each molecule in each sample - helpful for diagnostic/to investigate which samples are cross-contaminated the most.
+
+```{r}
+out <- swappedDrops(h5s, get.swapped=TRUE, get.diagnostics=TRUE)
+```
+
+Check how many molecules have been corrected between different sections.
+
+It looks like there are more swaps in the first two samples than others. As this is public data, it is unclear whether all the libraries were sequenced together - this is likely why we have such a difference. 
+```{r}
+lapply(out$swapped, sum)
+```
+
+Corrected or cleaned matrices are stored in "cleaned" slot. We can add these matrices to our Seurat objects at the start of the analysis instead of reading in the raw counts.
+```{r}
+out$cleaned[[1]][1:20, 1:20]
+```
+```{r}
+sessionInfo()
+```
+

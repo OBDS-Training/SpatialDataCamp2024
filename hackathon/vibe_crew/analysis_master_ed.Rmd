@@ -1,0 +1,651 @@
+---
+title: "Team Vibe Crew analysis"
+output: html_notebook
+---
+
+# Load the required libraries
+```{r setup}
+library(Seurat)
+library(ggplot2)
+library(scCustomize)
+library(readr)
+library(pheatmap)
+library(matrixStats)
+library(spdep)
+library(geojsonR)
+library(SingleCellExperiment)
+library(scuttle)
+library(cowplot)
+```
+
+# Prepare the Xenium seurat object
+```{r Load, eval=FALSE}
+start <- Sys.time()
+
+data_dir <- "/project/shared/spatial_data_camp/datasets/DATASET3/XENIUM_5K_LYMPH_NODE"
+
+data <- ReadXenium(data_dir, outs = "matrix", type=c("centroids", "segmentations"))
+
+end <- Sys.time()
+```
+
+```{r Benchmark, eval=FALSE}
+paste0("Time to read in the data: ", round(end - start, 2), " mins")
+```
+
+```{r Metadata, eval=FALSE}
+cell_meta_data <- read.csv(file.path(data_dir, "cells.csv.gz"))
+annot <- read_csv("/project/shared/spatial_data_camp/HACKATHON/vibe_crew/Xenium_Prime_Human_Lymph_Node_Reactive_FFPE_cell_types.csv")
+
+cell_meta_data <- merge(cell_meta_data, annot, by = "cell_id")
+remove(annot)
+
+head(cell_meta_data)
+```
+
+```{r, eval=FALSE}
+seurat <- CreateSeuratObject(counts = data$matrix[["Gene Expression"]],
+                                 assay = "XENIUM",
+                                 meta.data = cell_meta_data)
+
+seurat[["Negative.Control.Codeword"]] <- CreateAssayObject(counts = data$matrix[["Negative Control Codeword"]])
+seurat[["Negative.Control.Probe"]] <- CreateAssayObject(counts = data$matrix[["Negative Control Probe"]])
+seurat[["Unassigned.Codeword"]] <- CreateAssayObject(counts = data$matrix[["Unassigned Codeword"]])
+
+coords <- CreateFOV(coords = list(centroids = CreateCentroids(data$centroids), 
+                                  segmentation = CreateSegmentation(data$segmentations)),
+                    type = c("segmentation", "centroids"),
+                    assay = "XENIUM")
+seurat[["LN"]] <- coords
+```
+
+```{r Delete unused objects and purge, eval=FALSE}
+remove(list = list(data, coords, annot, cell_meta_data, start, end))
+gc()
+```
+
+```{r Save/load pre-computed object}
+#saveRDS(seurat, file = "/project/shared/spatial_data_camp/HACKATHON/vibe_crew/01_xenium_with_annot_and_fov_and_neg_probes.RDS")
+seurat <- readRDS(file = "/project/shared/spatial_data_camp/HACKATHON/vibe_crew/01_xenium_with_annot_and_fov_and_neg_probes.RDS")
+```
+
+```{r Rename celltype column}
+seurat$Celltype <- seurat$group
+seurat$group <- NULL
+```
+
+
+# Subset on the Xenium explorer outline
+
+```{r Read barcodes info}
+barcodes <- read_csv("/project/shared/spatial_data_camp/HACKATHON/vibe_crew/LN_whole_cells_stats.csv", skip = 2)
+colnames(barcodes) <- c("cell_id", "annotation", "no_transcripts", "area")
+```
+
+
+```{r Visualise filter}
+seurat$OUTLINE_FILTER <- seurat$cell_id %in% barcodes$cell_id
+ImageDimPlot(seurat, group.by="OUTLINE_FILTER")
+```
+
+```{r Subset, warning=FALSE}
+seurat <- subset(seurat, OUTLINE_FILTER)
+ImageDimPlot(seurat, group.by="OUTLINE_FILTER")
+```
+
+# Subset on the QC metrics
+
+```{r Select filtering method}
+method <- "MSD" #Select quantiles or MSD
+```
+
+
+## Transcript number
+```{r}
+if(method == "quantiles"){
+  seurat$TRANSCRIPT_FILTER <- seurat$nCount_XENIUM >= 15
+  ImageDimPlot(seurat, group.by="TRANSCRIPT_FILTER")
+}
+```
+
+## Cell size (min and max)
+```{r}
+if(method =="quantiles"){
+  seurat[["SIZE_FILTER_SMALL"]] <- seurat$cell_area > quantile(seurat$cell_area, .1)
+  seurat[["SIZE_FILTER_LARGE"]] <- seurat$cell_area < quantile(seurat$cell_area, .99)
+  ImageDimPlot(seurat, group.by="SIZE_FILTER_SMALL")
+  ImageDimPlot(seurat, group.by="SIZE_FILTER_LARGE")
+}
+```
+
+## Negative probes
+```{r}
+seurat[['PROBE_FILTER']] <- seurat$nCount_Unassigned.Codeword == 0 &
+                       seurat$nCount_Negative.Control.Codeword == 0 &
+                       seurat$nCount_Negative.Control.Probe == 0
+```
+
+## Per celltype filtering
+
+```{r}
+#Convert to SCE object
+Sce_object <- as.SingleCellExperiment(seurat)
+
+cells_celltype <- list()
+
+for (i in unique(seurat$Celltype)) {
+  cells_celltype[[i]] <- Sce_object[,rownames(as.data.frame(colData(Sce_object)) %>% dplyr::filter(Celltype == i))]
+}
+
+#Count cutoffs
+upper_cut_off_counts_celltype <- list()
+lower_cut_off_counts_celltype <- list()
+figures <- list()
+
+transcripts_counts_upper_outlier <- isOutlier(Sce_object$nCount_XENIUM, nmads = 2.5, share.mads = F,
+                                type="higher", batch=Sce_object$Celltype)
+
+transcripts_counts_lower_outlier <- isOutlier(Sce_object$nCount_XENIUM, nmads = 1.5, share.mads = F,
+                                type="lower", batch=Sce_object$Celltype)
+
+for (i in unique(seurat$Celltype)) {
+  
+  index <- match(i,unique(seurat$Celltype))
+  
+  upper_cut_off_counts_celltype[[i]] <- attr(transcripts_counts_upper_outlier, "thresholds")['higher', i]
+  lower_cut_off_counts_celltype[[i]] <- attr(transcripts_counts_lower_outlier, "thresholds")['lower', i]
+  
+  data <- data.frame(x=cells_celltype[[i]]$nCount_XENIUM, 
+                     Identity = cells_celltype[[i]]$Celltype)
+  
+  figures[[i]] <- ggplot(data,
+                        aes(x = x, fill = as.factor(Identity))) + 
+    geom_density(alpha = 0.5) +
+    geom_vline(xintercept = lower_cut_off_counts_celltype[[i]], colour="grey", linetype = "longdash") +
+    geom_vline(xintercept = upper_cut_off_counts_celltype[[i]], colour="grey", linetype = "longdash") +
+    labs(x = expression('log'[10]*'(Library Size)'), title = "Total count density", fill = "Ident") + 
+    theme_classic(base_size = 14)
+  
+} 
+
+combined_plot_reads <- ggpubr::ggarrange(plotlist = figures, ncol = 2, nrow = 2, align = 'h')
+
+# Get the number of unique subpopulations
+num_subpopulations <- length(unique(seurat$Celltype))
+
+# Calculate the number of chunks of 4 subpopulations
+num_chunks <- ceiling(num_subpopulations / 4)
+
+# Loop over the chunks
+for (i in seq_len(num_chunks)) {
+  # Calculate the start and end subpopulation for this chunk
+  start_subpopulation <- (i - 1) * 4 + 1
+  end_subpopulation <- min(i * 4, num_subpopulations)
+  
+  print(combined_plot_reads[[as.character(i)]])
+  
+}
+#Cell size cutoffs
+higher_cell_cut_off_size_celltype <- list()
+lower_cell_cut_off_size_celltype <- list()
+figures <- list()
+
+cell_size_upper_outlier <- isOutlier(Sce_object$cell_area, nmads = 2.5, share.mads = F,
+                                type="higher", batch=Sce_object$Celltype)
+
+cell_size_lower_outlier <- isOutlier(Sce_object$cell_area, nmads = 1.5, share.mads = F,
+                                type="lower", batch=Sce_object$Celltype)
+
+for (i in unique(seurat$Celltype)) {
+  
+  index <- match(i,unique(seurat$Celltype))
+  
+  higher_cell_cut_off_size_celltype[[i]] <- attr(cell_size_upper_outlier, "thresholds")['higher', i]
+  lower_cell_cut_off_size_celltype[[i]] <- attr(cell_size_lower_outlier, "thresholds")['lower', i]
+  
+  data <- data.frame(x=cells_celltype[[i]]$cell_area, 
+                     Identity = cells_celltype[[i]]$Celltype)
+  
+  figures[[i]] <- ggplot(data,
+                        aes(x = x, fill = as.factor(Identity))) + 
+    geom_density(alpha = 0.5) +
+    geom_vline(xintercept = higher_cell_cut_off_size_celltype[[i]], colour="grey", linetype = "longdash") +
+    geom_vline(xintercept = lower_cell_cut_off_size_celltype[[i]], colour="grey", linetype = "longdash") +
+    labs(x = expression('Cell Size'), title = "Total size density", fill = "Ident") + 
+    theme_classic(base_size = 14)
+  
+} 
+
+combined_plot_reads <- ggpubr::ggarrange(plotlist = figures, ncol = 2, nrow = 2, align = 'h')
+
+# Get the number of unique subpopulations
+num_subpopulations <- length(unique(seurat$Celltype))
+
+# Calculate the number of chunks of 4 subpopulations
+num_chunks <- ceiling(num_subpopulations / 4)
+
+# Loop over the chunks
+for (i in seq_len(num_chunks)) {
+  # Calculate the start and end subpopulation for this chunk
+  start_subpopulation <- (i - 1) * 4 + 1
+  end_subpopulation <- min(i * 4, num_subpopulations)
+  
+  print(combined_plot_reads[[as.character(i)]])
+  
+}
+
+#Cell Filtering
+
+count.drop <- list()
+size.drop <- list()
+
+SCE_objects <- list()
+SCE_objects.filtered <- list()
+
+for (i in unique(Sce_object$Celltype)) {
+  
+  SCE_objects[[i]] <- Sce_object[,colnames(cells_celltype[[i]])]
+  
+}
+
+for (i in unique(Sce_object$Celltype)) {
+
+  count.drop[[i]] <- grep('TRUE', cells_celltype[[i]]$nCount_XENIUM >= lower_cut_off_counts_celltype[[i]] & cells_celltype[[i]]$nCount_XENIUM <= upper_cut_off_counts_celltype[[i]])
+  size.drop[[i]] <- grep('TRUE', cells_celltype[[i]]$cell_area >= lower_cell_cut_off_size_celltype[[i]] & cells_celltype[[i]]$cell_area <= higher_cell_cut_off_size_celltype[[i]])
+  
+}
+
+for (i in unique(Sce_object$Celltype)) {
+  
+  SCE_objects.filtered[[i]] <- SCE_objects[[i]][,intersect(count.drop[[i]], size.drop[[i]])]
+  
+}
+
+cells_to_keep <- c()
+
+for (i in unique(Sce_object$Celltype)) {
+  
+  index <- match(i, unique(Sce_object$Celltype))
+
+  cells_to_keep <- c(cells_to_keep, colnames(SCE_objects.filtered[[i]]))
+  
+}
+
+Sce_object_filtered <- Sce_object[,cells_to_keep]
+
+# Export number of cells pre and post filtering
+
+print(paste0("Total cells before quality filtering = ",dim(Sce_object)[2]))
+print(paste0('Total cells before quality filtering, per sample:'))
+table(colData(Sce_object)$Donor_subpopulation)
+
+print(paste0("Total cells remaining after quality filtering = ",dim(Sce_object_filtered)[2]))
+print(paste0('Total cells after quality filtering, per sample:'))
+table(colData(Sce_object_filtered)$Celltype)
+
+df_number_of_cells <- data.frame(row.names = c('Before_filtering', 'After_filtering'))
+
+for (i in unique(Sce_object$Celltype)) {
+  
+  index <- match(i, unique(Sce_object$Celltype))
+
+  df_number_of_cells['Before_filtering', i] <- ncol(SCE_objects[[i]])
+  df_number_of_cells['After_filtering', i] <- ncol(SCE_objects.filtered[[i]])
+  
+}
+
+# Export qc metrics pre and post filtering
+
+df_qc <- data.frame()
+
+for (i in unique(Sce_object$Celltype)) {
+  
+  index <- match(i, unique(Sce_object$Celltype))
+
+  df_qc[i, 'Before_filtering__medianCount'] <- summary(colData(SCE_objects[[i]])$nCount_XENIUM)[[3]]
+  df_qc[i, 'After_filtering__medianCount'] <- summary(colData(SCE_objects.filtered[[i]])$nCount_XENIUM)[[3]]
+  df_qc[i, 'Before_filtering__medianSize'] <- summary(colData(SCE_objects[[i]])$nCount_XENIUM)[[3]]
+  df_qc[i, 'After_filtering__medianSize'] <- summary(colData(SCE_objects.filtered[[i]])$nCount_XENIUM)[[3]]
+  
+}
+```
+
+```{r Save the result}
+msd_barcodes <- colnames(Sce_object_filtered)
+write_csv(data.frame("cell_id" = msd_barcodes), file = "msd_barcodes.csv")
+```
+
+```{r Clean-up}
+remove(Sce_object)
+remove(Sce_object_filtered)
+remove(SCE_objects)
+remove(SCE_objects.filtered)
+```
+
+
+```{r Filter the object}
+if(method == "quantiles"){
+  seurat$COMBINED_FILTER <- seurat$PROBE_FILTER & seurat$SIZE_FILTER_SMALL & seurat$SIZE_FILTER_LARGE & seurat$TRANSCRIPT_FILTER
+} else if (method == "MSD"){
+  seurat$COMBINED_FILTER <- seurat$cell_id %in% msd_barcodes
+}
+
+ImageDimPlot(seurat, group.by="COMBINED_FILTER")
+```
+```{r, warning=FALSE}
+seurat <- subset(seurat, COMBINED_FILTER)
+saveRDS(seurat, "/project/shared/spatial_data_camp/HACKATHON/vibe_crew/02_xenium_after_QC_filtering.RDS")
+```
+
+# Answering the question: How does the high number of genes profiled improve analysis resolution?
+
+The approach I'm planning is:
+
+1. Extract only the IO panel genes from our filtered Seurat object
+
+vs. 
+
+2. Continue with whole panel
+
+Then perform:
+
+1. SCTransform
+2. PCA
+3. Clustering 
+4. UMAP
+5. Spatial Variable gene expression
+6. Compare list of these variable genes
+7. Compare the clusters that result
+
+## Filtered object on basis of IO
+
+Read in the IO panel
+
+```{r}
+io_genes <- read.csv("/project/bras2430/SHARED/spatial_data_camp/HACKATHON/vibe_crew/Xenium_hIO_v1_metadata.csv") %>% 
+  mutate(short_annotation = gsub(";.*", "", Annotation),
+         short_annotation = case_match(short_annotation, 
+                                       "B cell" ~ "B Cell",
+                                       "T cell" ~ "T Cell",
+                                       .default = short_annotation)) 
+
+```
+
+Read in the seurat object from before:
+
+```{r}
+seurat <- readRDS("02_xenium_after_QC_filtering.RDS")
+```
+
+For computational space going forward, we are going to take a portion of the LN:
+
+```{r}
+subset_barcodes <- read.csv("LN_subset_cells_stats.csv", skip = 2)
+seurat$SMALL_FRAGMENT_FILTER <- seurat$cell_id %in% subset_barcodes$Cell.ID
+```
+
+Now visualise this window:
+
+```{r}
+ImageDimPlot(seurat, group.by="SMALL_FRAGMENT_FILTER")
+```
+
+```{r}
+seurat_fragment <- subset(seurat, SMALL_FRAGMENT_FILTER)
+```
+
+
+Now subset it on the basis of genes:
+
+```{r}
+seurat_io <- seurat_fragment[rownames(seurat_fragment) %in% io_genes$Gene,] # Drops it to 274 x 98152
+seurat_io <- seurat_io[,colSums(seurat_io@assays$XENIUM$counts) > 0] # Drops it to 274 x 97958
+```
+
+Check out different dimensions of the two Seurat objects:
+
+```{r}
+rbind(`5k` = dim(seurat),
+      IO = dim(seurat_io))
+```
+
+Okay, so there are only 274 genes from the IO panel in the 5k panel (whereas I was expecting 380). How do these distribute?
+
+```{r}
+# Create an io_genes_subset, that is just the intersection with the 5K panel.
+io_genes_subset <- io_genes %>% 
+  dplyr::filter(Gene %in% rownames(seurat_io))
+
+# Create tables for the short_annotation column for the whole io_genes and the _subset version
+table(io_genes_subset$short_annotation) %>% 
+  as.data.frame() %>%
+  rename(category = "Var1", subset_count = "Freq") %>% 
+  left_join(table(io_genes$short_annotation) %>%
+              as.data.frame() %>%
+              rename(category = "Var1", whole_count = "Freq"),
+            .) %>% 
+  pivot_longer(cols = contains("count"), names_to = "whole_vs_subset", values_to = "count") %>% 
+  ggplot(aes(y = category, x = count, fill = whole_vs_subset)) +
+  geom_col(position = position_dodge2())
+
+
+io_genes_subset %>% 
+  ggplot(aes(y = short_annotation)) +
+  geom_bar()
+```
+
+And, specifically, these are the gene types that are found in the whole IO panel and not in the subset panel:
+
+```{r}
+unique(io_genes$short_annotation)[which(!(unique(io_genes$short_annotation) %in% unique(io_genes_subset$short_annotation)))]
+```
+
+So the gene types we are missing are mainly non-immune, apart from Neutrophils - which shouldn't reside in LNs anyway, to be fair.
+
+## Transforming the objects
+
+```{r}
+seurat <- SCTransform(seurat, assay = "XENIUM", clip.range = c(-10, 10))
+seurat_io <- SCTransform(seurat_io, assay = "XENIUM", clip.range = c(-10, 10))
+```
+
+## Running PCA
+
+```{r}
+seurat <- RunPCA(seurat)
+seurat_io <- RunPCA(seurat_io)
+```
+
+Now the elbow plot:
+
+```{r}
+(ElbowPlot(seurat, 50) + scale_y_continuous(limits = c(1, 6))) + 
+  (ElbowPlot(seurat_io, 50) + scale_y_continuous(limits = c(1, 6)))
+```
+
+```{r}
+data.frame(seurat@reductions$pca@stdev, seurat_io@reductions$pca@stdev) %>% 
+  rename(`5K` = "seurat.reductions.pca.stdev",
+         IO = "seurat_io.reductions.pca.stdev") %>%
+  mutate(PC = 1:50, .before = `5K`) %>% 
+  pivot_longer(cols = c(`5K`, IO), names_to = "Panel", values_to = "SD") %>% 
+  ggplot(aes(x = PC, y = SD, colour = Panel)) +
+  geom_point() +
+  labs(title = "PC Standard Deviations")
+```
+
+
+We will take the first 25 PCs for both objects, but there is less clear inflexion in the smaller panel.
+
+```{r}
+(ImageFeaturePlot(seurat, "PC_1") + scale_fill_viridis_c() + labs(title = "5K")) +
+(ImageFeaturePlot(seurat_io, "PC_1") + scale_fill_viridis_c() + labs(title = "IO"))
+```
+
+```{r}
+
+```
+
+## Run UMAPs
+
+```{r}
+seurat <- RunUMAP(seurat, dims = 1:25)
+seurat <- FindNeighbors(seurat, reduction = "pca", dims = 1:25)
+seurat <- FindClusters(seurat, resolution = 0.4)
+```
+
+```{r}
+seurat_io <- RunUMAP(seurat_io, dims = 1:25)
+seurat_io <- FindNeighbors(seurat_io, reduction = "pca", dims = 1:25)
+seurat_io <- FindClusters(seurat_io, resolution = 0.4)
+```
+
+## Compare UMAP plots and clustering
+
+```{r}
+DimPlot(seurat, label=T, repel=T) + labs(title = "5K")
+DimPlot(seurat_io, label=T, repel=T)  + labs(title = "IO")
+```
+
+```{r}
+DimPlot(seurat, group.by = "Celltype", label=T, repel=T) + 
+  labs(title = "5K") +
+  scale_fill_manual(values = c('Hematopoietic Stem Cell' = '#82A0BC',
+                    'Mast Cell' = '#FB7A13',
+                    'Neutrophil' = '#06D6A0',
+                    "Non Classical Monocyte" = '#00A8E8',
+                    'Intermediate Monocyte' = '#007EA7',
+                    'Classical Monocyte' = '#003459',
+                    "Macrophage" = '#5A189A',
+                    'Erythrocyte' = '#C1121F',
+                    'Plasma Cell' = '#C1B793',
+                    'T Cell' = '#7D676D',
+                    "CD4+ αβ Memory T Cell" = '#D5BDAF',
+                    "Effector CD8+ αβ T Cell" = '#A9927D',
+                    "Regulatory T Cell" = '#E0AFA0',
+                    "Effector CD4+ αβ T Cell" = '#C0C0C0',
+                    "Naive Thymus Derived CD4+ αβ T Cell" = '#EFCFE3',
+                    "CD8+ αβ Memory T Cell" = '#9381FF',
+                    "Stromal Cell" = '#FCA311',
+                    'Mature Conventional Dendritic Cell' = '#99582A',
+                    'CD1c+ Myeloid Dendritic Cell' = '#432818',
+                    'CD141+ Myeloid Dendritic Cell' = '#BB9457',
+                    'Mature NK T Cell' = '#A4C3B2',
+                    'Type I NK T Cell' = '#6B9080',
+                    'Plasmacytoid Dendritic Cell' = '#61B4EC',
+                    'B Cell' = '#B4D5A1',
+                    "Naive B Cell" = '#90BE6D',
+                    "Memory B Cell" = '#A7C957',
+                    "Innate Lymphoid Cell" = '#FF8FAB',
+                    "Endothelial Cell" = '#540B0E'), na.value = '#E6E7E9') +
+  theme(legend.position = "none")
+
+DimPlot(seurat_io, group.by = "Celltype", label=T, repel=T) + 
+  labs(title = "IO") +
+  scale_fill_manual(values = c('Hematopoietic Stem Cell' = '#82A0BC',
+                    'Mast Cell' = '#FB7A13',
+                    'Neutrophil' = '#06D6A0',
+                    "Non Classical Monocyte" = '#00A8E8',
+                    'Intermediate Monocyte' = '#007EA7',
+                    'Classical Monocyte' = '#003459',
+                    "Macrophage" = '#5A189A',
+                    'Erythrocyte' = '#C1121F',
+                    'Plasma Cell' = '#C1B793',
+                    'T Cell' = '#7D676D',
+                    "CD4+ αβ Memory T Cell" = '#D5BDAF',
+                    "Effector CD8+ αβ T Cell" = '#A9927D',
+                    "Regulatory T Cell" = '#E0AFA0',
+                    "Effector CD4+ αβ T Cell" = '#C0C0C0',
+                    "Naive Thymus Derived CD4+ αβ T Cell" = '#EFCFE3',
+                    "CD8+ αβ Memory T Cell" = '#9381FF',
+                    "Stromal Cell" = '#FCA311',
+                    'Mature Conventional Dendritic Cell' = '#99582A',
+                    'CD1c+ Myeloid Dendritic Cell' = '#432818',
+                    'CD141+ Myeloid Dendritic Cell' = '#BB9457',
+                    'Mature NK T Cell' = '#A4C3B2',
+                    'Type I NK T Cell' = '#6B9080',
+                    'Plasmacytoid Dendritic Cell' = '#61B4EC',
+                    'B Cell' = '#B4D5A1',
+                    "Naive B Cell" = '#90BE6D',
+                    "Memory B Cell" = '#A7C957',
+                    "Innate Lymphoid Cell" = '#FF8FAB',
+                    "Endothelial Cell" = '#540B0E'), na.value = '#E6E7E9') +
+  theme(legend.position = "none")
+```
+
+```{r, fig.width = 12, fig.height = 8}
+ImageDimPlot(seurat, group.by = "Celltype", size=.5) + labs(title = "5K")
+```
+
+
+
+
+```{r}
+(ImageDimPlot(seurat, size=.5) + labs(title = "5K")) + 
+(ImageDimPlot(seurat_io, size = .5) + labs(title = "IO"))
+```
+
+## Repeat the above but better
+
+I'm thinking it would be interesting to do all the above on 10 random genes, 50 random genes, 100 and 200. What can it do?!
+
+```{r}
+ten <- sample(rownames(seurat), size = 10)
+fifty <- sample(rownames(seurat), size = 50)
+hundred <- sample(rownames(seurat), size = 100)
+two_hundred <- sample(rownames(seurat), size = 200)
+five_hundred <- sample(rownames(seurat), size = 500)
+one_thousand <- sample(rownames(seurat), size = 1000)
+```
+
+```{r}
+seurat_10 <- seurat_fragment[rownames(seurat_fragment) %in% ten,]
+seurat_10 <- seurat_10[,colSums(seurat_10@assays$XENIUM$counts) > 0]
+seurat_50 <- seurat_fragment[rownames(seurat_fragment) %in% fifty,]
+seurat_50 <- seurat_50[,colSums(seurat_50@assays$XENIUM$counts) > 0]
+seurat_100 <- seurat_fragment[rownames(seurat_fragment) %in% hundred,]
+seurat_100 <- seurat_100[,colSums(seurat_100@assays$XENIUM$counts) > 0]
+seurat_200 <- seurat_fragment[rownames(seurat_fragment) %in% two_hundred,]
+seurat_200 <- seurat_200[,colSums(seurat_200@assays$XENIUM$counts) > 0]
+seurat_500 <- seurat_fragment[rownames(seurat_fragment) %in% five_hundred,]
+seurat_500 <- seurat_500[,colSums(seurat_500@assays$XENIUM$counts) > 0]
+seurat_1000 <- seurat_fragment[rownames(seurat_fragment) %in% one_thousand,]
+seurat_1000 <- seurat_1000[,colSums(seurat_1000@assays$XENIUM$counts) > 0]
+```
+
+### Transforming ten, fifty, etc.
+
+```{r}
+seurat_objects <- list(ten = seurat_10,
+                       fifty = seurat_50,
+                       hundred = seurat_100,
+                       two_hundred = seurat_200,
+                       five_hundred = seurat_500,
+                       one_thousand = seurat_1000)
+
+seurat_objects <- seurat_objects %>% 
+  map(\(x) SCTransform(x, assay = "XENIUM", clip.range = c(-10, 10)))
+```
+
+### Running PCA
+
+```{r}
+seurat_objects <- seurat_objects %>% 
+  map(\(x) RunPCA(x)) 
+```
+
+ElbowPlot time:
+
+```{r}
+seurat_objects %>% 
+  map(\(x) ElbowPlot(x, 50) + labs(title = names(x))) %>% 
+  plot_grid(plotlist = .)
+```
+
+```{r}
+seurat_objects %>% 
+  map(\(x) ImageFeaturePlot(x, "PC_1") + scale_fill_viridis_c() + labs(title = names(x)))
+```
+
+
+### Running UMAPs
